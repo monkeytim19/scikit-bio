@@ -58,7 +58,9 @@ class AlphaDiversityTests(TestCase):
     def test_faith_pd_bptree_engines(self):
         # faith_pd on a BPTree goes through the whole-vector fast path and
         # matches the TreeNode result elementwise (index + dtype) per engine.
-        engines = ["cython"] + (["numba"] if NUMBA_AVAILABLE else [])
+        from skbio.diversity.alpha.tests.test_pd import _BP_ENGINES
+
+        engines = _BP_ENGINES
         ref = alpha_diversity('faith_pd', self.table1, self.sids1,
                               taxa=self.oids1, tree=self.tree1)
         bp = BPTree.from_treenode(self.tree1)

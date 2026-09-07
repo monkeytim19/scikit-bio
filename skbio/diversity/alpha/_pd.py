@@ -134,6 +134,25 @@ def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
     return perm, lo, hi, lengths
 
 
+#: Engines Faith's PD accepts for a ``BPTree``. ``"gpu"`` is deliberately absent
+#: from ``set_config``'s options (see :mod:`skbio._config`): it is a per-call
+#: choice, because whether the device wins depends on the shape of the workload.
+_BP_PD_ENGINES = ("cython", "numba", "gpu")
+
+
+def _resolve_bp_engine(engine):
+    """Resolve an engine name for Faith's PD, requiring numba for the fast ones.
+
+    :func:`~skbio._config._resolve_engine` guards the literal ``"numba"`` only,
+    so ``"gpu"`` -- whose device kernels are built with numba -- has to check
+    the same dependency itself.
+    """
+    engine = _resolve_engine(engine, _BP_PD_ENGINES)
+    if engine == "gpu" and not NUMBA_AVAILABLE:
+        raise ImportError("engine='gpu' requires the optional numba dependency.")
+    return engine
+
+
 def _warn_engine_needs_bptree(engine, stacklevel):
     """Warn that an explicitly requested engine needs a ``BPTree`` to be served.
 
@@ -243,10 +262,21 @@ def _faith_pd_bp_run(counts, taxa, tree, validate, engine, single_sample):
         counts, taxa, tree, validate, single_sample=single_sample
     )
     presence = _presence_in_tip_order(counts, perm)
-    if engine == "numba":
-        out = _faith_pd_bp_nb(presence, lo, hi, lengths)
-    else:
-        out = _faith_pd_bp_cython(presence, lo, hi, lengths)
+    out = None
+    if engine == "gpu":
+        from ._pd_gpu import run_faith_pd_gpu
+
+        buf = np.empty(presence.shape[0], dtype=np.float64)
+        if run_faith_pd_gpu(presence, lo, hi, lengths, buf):
+            out = buf
+        else:
+            # no usable device; _pd_gpu has warned once already
+            engine = "numba"
+    if out is None:
+        if engine == "numba":
+            out = _faith_pd_bp_nb(presence, lo, hi, lengths)
+        else:
+            out = _faith_pd_bp_cython(presence, lo, hi, lengths)
     return out[0] if single_sample else out
 
 
@@ -304,10 +334,14 @@ def faith_pd(counts, taxa, tree, validate=True, engine=None):
         entails so you can determine if you can safely disable validation.
     engine : str, optional
         Compute engine for a :class:`~skbio.tree.BPTree` input: ``"cython"``
-        (default) or ``"numba"`` (requires the optional ``numba`` package). It is
-        ignored for :class:`~skbio.TreeNode` input, where a non-default engine
-        emits a warning and the cython path is used. Defaults to the global
-        ``engine`` configuration option.
+        (default), ``"numba"`` or ``"gpu"`` (both require the optional ``numba``
+        package; ``"gpu"`` additionally needs a CUDA or ROCm device, and falls
+        back to ``"numba"`` when none is usable). ``"gpu"`` must be asked for
+        explicitly -- it pays a host-to-device transfer that only wins on large
+        sample counts -- and is not a valid global default. The engine is
+        ignored for :class:`~skbio.TreeNode` input, where an explicitly
+        requested non-cython engine emits a warning and the cython path is used.
+        Defaults to the global ``engine`` configuration option.
 
     Returns
     -------
@@ -407,7 +441,7 @@ def faith_pd(counts, taxa, tree, validate=True, engine=None):
     6.95
 
     """
-    resolved_engine = _resolve_engine(engine, ("cython", "numba"))
+    resolved_engine = _resolve_bp_engine(engine)
     if isinstance(tree, BPTree):
         return _faith_pd_bp_run(counts, taxa, tree, validate, resolved_engine, True)
     # helper -> faith_pd -> the params_aliased wrapper -> the caller

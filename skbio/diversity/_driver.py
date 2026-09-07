@@ -17,7 +17,6 @@ from typing import Any, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
-from skbio._config import _resolve_engine
 from skbio.diversity import alpha
 from skbio.diversity.alpha._pd import (
     _setup_pd,
@@ -25,6 +24,7 @@ from skbio.diversity.alpha._pd import (
     _phydiv,
     _faith_pd_bp_run,
     _warn_engine_needs_bptree,
+    _resolve_bp_engine,
 )
 from skbio.diversity.beta._unifrac import (
     _setup_multiple_unweighted_unifrac,
@@ -183,11 +183,14 @@ def alpha_diversity(
         metric. See :mod:`skbio.diversity` for the details of validation.
     engine : str, optional
         Compute engine for ``faith_pd`` when ``tree`` is a
-        :class:`~skbio.tree.BPTree`: ``"cython"`` (default) or ``"numba"``
-        (requires the optional ``numba`` package). The whole vector is computed in
-        one call, bypassing the per-sample loop. Ignored for other metrics and for
-        :class:`~skbio.TreeNode` input, where a non-default engine warns. Defaults
-        to the global ``engine`` configuration option.
+        :class:`~skbio.tree.BPTree`: ``"cython"`` (default), ``"numba"`` or
+        ``"gpu"`` (both require the optional ``numba`` package; ``"gpu"``
+        additionally needs a CUDA or ROCm device and falls back to ``"numba"``
+        when none is usable). The whole vector is computed in one call,
+        bypassing the per-sample loop. Ignored for other metrics and for
+        :class:`~skbio.TreeNode` input, where an explicitly requested
+        non-cython engine warns. Defaults to the global ``engine``
+        configuration option.
     kwargs : dict, optional
         Metric-specific parameters. Refer to the documentation of the chosen metric.
         A special parameter is ``taxa``, needed by some phylogenetic metrics. If not
@@ -224,7 +227,7 @@ def alpha_diversity(
         taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
         is_faith_pd = metric == "faith_pd"
         if is_faith_pd:
-            resolved_engine = _resolve_engine(engine, ("cython", "numba"))
+            resolved_engine = _resolve_bp_engine(engine)
             if _faith_pd_bp_fast_path_eligible(tree, engine):
                 # Compute the whole vector in one engine call: no
                 # (n_samples, n_nodes) counts_by_node matrix and no per-sample

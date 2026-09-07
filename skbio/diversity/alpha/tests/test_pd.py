@@ -20,9 +20,25 @@ from skbio.tree import BPTree, DuplicateNodeError, MissingNodeError
 from skbio.diversity import alpha_diversity
 from skbio.diversity.alpha import faith_pd, phydiv
 from skbio.diversity.alpha._pd import NUMBA_AVAILABLE
+from skbio.util import numba_code
 
-# engines to exercise; numba only if the optional dependency is importable
-_BP_ENGINES = ["cython"] + (["numba"] if NUMBA_AVAILABLE else [])
+
+def _gpu_available():
+    """Whether a device Numba can actually build and launch kernels on exists."""
+    if not NUMBA_AVAILABLE:
+        return False
+    from skbio.diversity.alpha import _pd_gpu
+
+    return _pd_gpu._numba_gpu_module() is not None
+
+
+GPU_AVAILABLE = _gpu_available()
+
+# engines to exercise; the accelerated ones only where they can actually run,
+# so the whole parity suite below covers each of them on a capable machine
+_BP_ENGINES = (["cython"]
+               + (["numba"] if NUMBA_AVAILABLE else [])
+               + (["gpu"] if GPU_AVAILABLE else []))
 
 
 class FaithPDTests(TestCase):
@@ -353,7 +369,10 @@ class FaithPDBPTreeEngineTests(TestCase):
                 "faith_pd", self.b1, ids=list("ABCDE"), taxa=self.oids1,
                 tree=bp, engine=eng,
             )
-            pd.testing.assert_series_equal(ref, got)
+            # the GPU sums in a different order, so compare to float64
+            # tolerance rather than exactly
+            pd.testing.assert_series_equal(ref, got, check_exact=False,
+                                           rtol=1e-12)
 
     def test_treenode_noncython_engine_warns_and_falls_back(self):
         # an explicit non-cython engine on a TreeNode warns once and returns
@@ -392,6 +411,71 @@ class FaithPDBPTreeEngineTests(TestCase):
             set_config("engine", prev)
         self.assertAlmostEqual(got, faith_pd(self.b1[0], self.oids1, self.t1),
                                places=10)
+
+    @numba_code
+    def test_gpu_engine_falls_back_without_a_device(self):
+        # engine="gpu" on a machine with no usable device must not raise: the
+        # runner returns False, _pd_gpu warns once, and the CPU kernels answer.
+        from skbio.diversity.alpha import _pd_gpu
+
+        ref = faith_pd(self.b1[0], self.oids1, self.t1)
+        bp = BPTree.from_treenode(self.t1)
+        real = _pd_gpu._numba_gpu_module
+        _pd_gpu._numba_gpu_module = lambda: None
+        try:
+            got = faith_pd(self.b1[0], self.oids1, bp, engine="gpu")
+        finally:
+            _pd_gpu._numba_gpu_module = real
+        self.assertAlmostEqual(got, ref, places=10)
+
+    @numba_code
+    def test_gpu_kernel_failure_warns_once_and_yields_to_the_cpu(self):
+        # a device that cannot build the kernels must be recorded, warned about
+        # exactly once, and then skipped for the rest of the process.
+        from skbio.diversity.alpha import _pd_gpu
+
+        ref = faith_pd(self.b1[0], self.oids1, self.t1)
+        bp = BPTree.from_treenode(self.t1)
+        real_prepare = _pd_gpu._prepare
+        real_unavail = set(_pd_gpu._unavailable)
+
+        def boom():
+            _pd_gpu._mark_gpu_unavailable("pretend")
+            return None, None
+
+        _pd_gpu._prepare = boom
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                got = faith_pd(self.b1[0], self.oids1, bp, engine="gpu")
+                # a second call must not warn again
+                faith_pd(self.b1[0], self.oids1, bp, engine="gpu")
+            msgs = [str(w.message) for w in caught
+                    if "could not be used" in str(w.message)]
+            self.assertEqual(len(msgs), 1, msgs)
+            self.assertIn("pretend", msgs[0])
+            self.assertAlmostEqual(got, ref, places=10)
+        finally:
+            _pd_gpu._prepare = real_prepare
+            _pd_gpu._unavailable.clear()
+            _pd_gpu._unavailable.update(real_unavail)
+
+    def test_gpu_engine_needs_numba(self):
+        # "gpu" is a valid engine name, but the device kernels are built with
+        # numba, which _resolve_engine only guards for the literal "numba".
+        from skbio.diversity.alpha._pd import _resolve_bp_engine
+
+        if NUMBA_AVAILABLE:
+            self.assertEqual(_resolve_bp_engine("gpu"), "gpu")
+        else:
+            self.assertRaises(ImportError, _resolve_bp_engine, "gpu")
+
+    def test_gpu_is_not_a_valid_global_default(self):
+        # engine="gpu" is a per-call choice: whether the transfer pays depends
+        # on the workload, so it must not be settable as a global default.
+        from skbio import set_config
+
+        self.assertRaises(ValueError, set_config, "engine", "gpu")
 
     def test_unsupported_engine_rejected(self):
         bp = BPTree.from_treenode(self.t1)
