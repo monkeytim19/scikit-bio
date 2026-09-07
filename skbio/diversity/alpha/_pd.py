@@ -12,6 +12,8 @@ from skbio.diversity._util import (
     _validate_counts_vector,
     vectorize_counts_and_tree,
 )
+from skbio.tree import BPTree
+from skbio.tree._exception import DuplicateNodeError, MissingNodeError
 from skbio.tree._utils import _validate_taxa_and_tree
 from skbio.util._decorator import params_aliased
 
@@ -29,6 +31,90 @@ def _setup_pd(counts, taxa, tree, validate, rooted, single_sample):
     counts_by_node, _, branch_lengths = vectorize_counts_and_tree(counts, taxa, tree)
 
     return counts_by_node, branch_lengths
+
+
+def _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths):
+    """Validate taxa and a ``BPTree`` prior to Faith's PD.
+
+    The ``BPTree`` twin of :func:`~skbio.tree._utils._validate_taxa_and_tree`,
+    which is TreeNode-only (it calls ``tree.root().children`` and
+    ``tree.tips()``). Checks run against the arrays returned by
+    :meth:`BPTree._to_tip_range_arrays` plus a root-degree check via BP
+    navigation.
+
+    Notes
+    -----
+    ``BPTree`` collapses a missing branch length to ``0.0`` at construction
+    (``from_treenode`` uses ``n.length or 0.0``), so a "no length" tree cannot
+    be represented; the nan-length check here is therefore defensive.
+    """
+    if len(taxa) != len(set(taxa)):
+        raise ValueError("All taxa must be unique.")
+
+    # rooted: the root has at most two children
+    root = tree.root()
+    child = tree.first_child(root)
+    n_root_children = 0
+    while child != 0:
+        n_root_children += 1
+        child = tree.next_sibling(child)
+    if n_root_children > 2:
+        raise ValueError("The tree must be rooted.")
+
+    # non-root nodes must have a branch length (lengths[0] is the root)
+    if np.isnan(lengths[1:]).any():
+        raise ValueError("All non-root nodes in the tree must have a branch length.")
+
+    tip_name_set = set(tip_names)
+    if len(tip_names) != len(tip_name_set):
+        raise DuplicateNodeError("All tip names in the tree must be unique.")
+
+    if missing := set(taxa) - tip_name_set:
+        raise MissingNodeError(
+            f"{len(missing)} taxa are not present as tip names in the tree."
+        )
+
+
+def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
+    """Validate and build compacted tip-range index arrays for a ``BPTree``.
+
+    The ``BPTree`` twin of :func:`_setup_pd`. Rather than materializing the
+    ``(n_samples, n_nodes)`` ``counts_by_node`` matrix, it translates each
+    node's descendant-tip range into the space of the ``taxa`` columns, so the
+    only per-call reordering downstream is a single boolean gather.
+
+    Returns
+    -------
+    perm : ndarray of int32, shape (n_taxa,)
+        Reorders the ``taxa`` columns into ascending tip order.
+    lo, hi : ndarray of int32, shape (n_nodes,)
+        Half-open ``[lo, hi)`` bounds of each node's descendant taxa in the
+        reordered column space. Nodes with no descendant taxa get ``lo == hi``.
+    lengths : ndarray of float64, shape (n_nodes,)
+        Branch length of each node (preorder), with nan collapsed to ``0.0``.
+    """
+    lengths, tip_first, tip_last, tip_names = tree._to_tip_range_arrays()
+
+    if validate:
+        # Only validate counts in single-sample mode; the driver validates the
+        # whole matrix once otherwise.
+        if single_sample:
+            counts = _validate_counts_vector(counts)
+            if counts.size != len(taxa):
+                raise ValueError("`taxa` must be the same length as `counts`.")
+        _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths)
+
+    # Map each taxon to its tip rank, then compact the (full) node tip-ranges
+    # onto the taxa columns via a single sort + two searchsorted lookups.
+    rank = {name: r for r, name in enumerate(tip_names)}
+    tip_rank = np.fromiter((rank[t] for t in taxa), np.int32, len(taxa))
+    perm = np.argsort(tip_rank, kind="stable").astype(np.int32)
+    srt = tip_rank[perm]
+    lo = np.searchsorted(srt, tip_first).astype(np.int32)
+    hi = np.searchsorted(srt, tip_last + 1).astype(np.int32)
+
+    lengths[np.isnan(lengths)] = 0.0
+    return perm, lo, hi, lengths
 
 
 def _faith_pd(counts_by_node, branch_lengths):
