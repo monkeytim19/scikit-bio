@@ -230,7 +230,13 @@ def _counts_in_tip_order(counts, perm):
 
     """
     reordered = np.take(np.atleast_2d(counts), perm, axis=1)
-    return reordered.astype(np.int64).astype(np.float64)
+    # Truncate toward zero only for non-integer input (the TreeNode
+    # counts_by_node is int64, so it truncates there). Integer input needs no
+    # truncation and casts to float64 in a single pass, avoiding a transient
+    # int64 copy that would otherwise double peak memory at scale.
+    if np.issubdtype(reordered.dtype, np.floating):
+        reordered = np.trunc(reordered)
+    return reordered.astype(np.float64, copy=False)
 
 
 def _faith_pd_bp_cython(presence, lo, hi, lengths, max_bytes=64 * 1024 * 1024):
