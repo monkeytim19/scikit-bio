@@ -151,6 +151,7 @@ doctest_optionflags = [
 ]
 markers = [
     "array_api: tests that exercise the Array API across backends",
+    "numba: tests that exercise optional Numba-accelerated code paths",
 ]
 
 [tool.check-manifest]
