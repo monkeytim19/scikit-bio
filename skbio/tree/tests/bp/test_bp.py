@@ -42,6 +42,38 @@ class BPTests(TestCase):
         with self.assertRaises(ValueError):
             BPTree(np.array([1, 1, 0], dtype=np.uint8))
 
+    def test__to_tip_range_arrays(self):
+        # the single compiled pass must reproduce, for every node, the branch
+        # length and the contiguous descendant-tip-rank interval that BP
+        # navigation (preorder_select/close/is_tip) yields.
+        for nwk in [
+            "((a:1,b:2)c:3,(d:4,e:5)f:6)root;",
+            "(a,b,c,d,e)r;",                    # multifurcation
+            "(((a,b),c),d);",                   # caterpillar
+            "((a,(b,c)),((d,e),(f,(g,h))));",   # deeper, mixed
+        ]:
+            bp = parse_newick(nwk)
+            lengths, tip_first, tip_last, tip_names = bp._to_tip_range_arrays()
+            self.assertEqual(lengths.dtype, np.float64)
+            self.assertEqual(tip_first.dtype, np.int32)
+            self.assertEqual(tip_last.dtype, np.int32)
+
+            n, sz = len(bp), bp.data.size
+            tip_pos = [i for i in range(sz) if bp.is_tip(i)]
+            rank_of = {p: r for r, p in enumerate(tip_pos)}
+            # tip names in tip (position) order
+            self.assertEqual(list(tip_names), [bp.name(p) for p in tip_pos])
+            # per node (preorder id): length + descendant-tip interval
+            for m in range(n):
+                i = bp.preorder_select(m)
+                npt.assert_allclose(lengths[m], bp.length(i))
+                desc = [rank_of[p] for p in tip_pos if i <= p <= bp.close(i)]
+                self.assertEqual(tip_first[m], min(desc))
+                self.assertEqual(tip_last[m], max(desc))
+            # the root spans every tip
+            self.assertEqual(tip_first[0], 0)
+            self.assertEqual(tip_last[0], len(tip_names) - 1)
+
     def test_rmq(self):
         #       (  (  (  )  (  )  (  (  )  )   )   (   )   (   (   (   )   (   )   )   )   )
         #excess 1  2  3  2  3  2  3  4  3  2   1   2   1   2   3   4   3   4   3   2   1   0

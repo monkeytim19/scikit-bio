@@ -543,6 +543,82 @@ cdef class BPTree:
 
         return name, length, edge, parent
 
+    def _to_tip_range_arrays(self):
+        """Return per-node descendant-tip ranges for array-native reductions.
+
+        A single left-to-right pass over the parenthesis array assigns each
+        node its preorder rank and records, for every node, the contiguous
+        range of descendant-tip ranks ``[tip_first, tip_last]`` (inclusive;
+        tips are numbered in the order they appear). This is the structural
+        fact that lets a post-order reduction (such as Faith's PD
+        ``counts_by_node``) be answered as a prefix-sum range query rather than
+        a sequential tree walk. It parallels :meth:`_to_node_arrays` in doing
+        the whole traversal in a single compiled pass.
+
+        Returns
+        -------
+        tuple of numpy.ndarray
+            ``(lengths, tip_first, tip_last, tip_names)``. ``lengths`` is
+            ``float64`` and ``tip_first``/``tip_last`` are ``int32``, each
+            indexed by preorder rank; ``tip_names`` is object-dtype in tip
+            order.
+
+        See Also
+        --------
+        _to_node_arrays
+
+        """
+        cdef:
+            Py_ssize_t j, node, r, m, n, n_tips, sp, sz
+            Py_ssize_t INT32_MAX = 2147483647
+            BOOL_t* b
+            DOUBLE_t[:] lengths_view
+            cnp.ndarray[object, ndim=1] names
+            cnp.ndarray[DOUBLE_t, ndim=1] lengths
+            cnp.ndarray[INT32_t, ndim=1] tip_first
+            cnp.ndarray[INT32_t, ndim=1] tip_last
+            cnp.ndarray[object, ndim=1] tip_names
+            Py_ssize_t[:] stack
+
+        b = self._b_ptr
+        sz = self.size
+        lengths_view = self._lengths
+        names = self._names
+
+        n = <Py_ssize_t>self.data.sum()          # node count (opening parens)
+        if n > INT32_MAX:
+            raise ValueError(
+                "tree has more than 2**31-1 nodes; int32 tip-range indices "
+                "would overflow"
+            )
+        n_tips = self.count(tips=True)
+
+        lengths = np.empty(n, dtype=DOUBLE)
+        tip_first = np.empty(n, dtype=INT32)
+        tip_last = np.empty(n, dtype=INT32)
+        tip_names = np.empty(n_tips, dtype=object)
+        stack = np.empty(n, dtype=SIZE)          # LIFO of open nodes; depth <= n
+
+        r = 0            # next tip rank
+        m = 0            # next preorder rank (node id)
+        sp = 0           # stack pointer
+        for j in range(sz):
+            if b[j]:                             # opening parenthesis: a node
+                node = m
+                m += 1
+                tip_first[node] = <INT32_t>r
+                lengths[node] = lengths_view[j]
+                if j + 1 < sz and not b[j + 1]:  # node is a tip
+                    tip_names[r] = names[j]
+                    r += 1
+                stack[sp] = node
+                sp += 1
+            else:                                # closing parenthesis
+                sp -= 1
+                tip_last[stack[sp]] = <INT32_t>(r - 1)
+
+        return lengths, tip_first, tip_last, tip_names
+
     def set_names(self, cnp.ndarray[object, ndim=1] names):
         self._names = names
 
