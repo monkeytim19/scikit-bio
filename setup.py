@@ -160,6 +160,8 @@ extensions = [
         "skbio.diversity._phylogenetic",
         ["skbio/diversity/_phylogenetic" + ext],
         include_dirs=[np.get_include()],
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
     ),
     Extension(
         "skbio.stats.ordination._cutils",

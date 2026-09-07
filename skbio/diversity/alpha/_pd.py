@@ -17,6 +17,13 @@ from skbio.tree._exception import DuplicateNodeError, MissingNodeError
 from skbio.tree._utils import _validate_taxa_and_tree
 from skbio.util._decorator import params_aliased
 
+try:
+    from numba import njit, prange
+
+    NUMBA_AVAILABLE = True
+except ImportError:  # pragma: no cover - exercised only where numba is absent
+    NUMBA_AVAILABLE = False
+
 
 def _setup_pd(counts, taxa, tree, validate, rooted, single_sample):
     if validate:
@@ -115,6 +122,57 @@ def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
 
     lengths[np.isnan(lengths)] = 0.0
     return perm, lo, hi, lengths
+
+
+def _faith_pd_bp_cython(presence, lo, hi, lengths, max_bytes=64 * 1024 * 1024):
+    """Chunked driver for the OpenMP ``_faith_pd_bp`` cython kernel.
+
+    Chunks over samples against a byte budget so the per-sample prefix scratch
+    stays bounded regardless of ``n_samples``.
+    """
+    from skbio.diversity._phylogenetic import _faith_pd_bp
+
+    n_samples, n_taxa = presence.shape
+    out = np.empty(n_samples, dtype=np.float64)
+    chunk = max(1, max_bytes // ((n_taxa + 1) * 4))
+    pref = np.empty((min(chunk, n_samples), n_taxa + 1), dtype=np.int32)
+    for start in range(0, n_samples, chunk):
+        stop = min(start + chunk, n_samples)
+        _faith_pd_bp(
+            presence[start:stop],
+            lo,
+            hi,
+            lengths,
+            pref[: stop - start],
+            out[start:stop],
+        )
+    return out
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(parallel=True)
+    def _faith_pd_bp_nb(presence, lo, hi, lengths):
+        """Numba-parallel counterpart of the ``_faith_pd_bp`` cython kernel.
+
+        Numba may allocate inside a ``parfor``, so each sample gets its own
+        prefix buffer and no caller-supplied scratch is needed.
+        """
+        n_samples = presence.shape[0]
+        n_taxa = presence.shape[1]
+        n_nodes = lengths.shape[0]
+        out = np.zeros(n_samples, np.float64)
+        for s in prange(n_samples):
+            pref = np.empty(n_taxa + 1, np.int32)
+            pref[0] = 0
+            for j in range(n_taxa):
+                pref[j + 1] = pref[j] + presence[s, j]
+            acc = 0.0
+            for k in range(n_nodes):
+                if pref[hi[k]] - pref[lo[k]] > 0:
+                    acc += lengths[k]
+            out[s] = acc
+        return out
 
 
 def _faith_pd(counts_by_node, branch_lengths):

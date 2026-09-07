@@ -9,6 +9,7 @@
 import numpy as np
 cimport numpy as np
 cimport cython
+from cython.parallel cimport prange
 
 # platform-specific
 INDEX_DTYPE = np.intp
@@ -221,3 +222,51 @@ def _nodes_by_counts(np.ndarray counts,
     _traverse_reduce(child_index, count_array)
 
     return count_array
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def _faith_pd_bp(np.uint8_t[:, ::1] presence,
+                 np.int32_t[::1] lo,
+                 np.int32_t[::1] hi,
+                 np.double_t[::1] lengths,
+                 np.int32_t[:, ::1] pref,
+                 np.double_t[::1] out):
+    """Batched Faith's PD over a BPTree's compacted tip-range arrays.
+
+    An OpenMP-parallel (``prange``) reduction that supersedes the sequential
+    post-order accumulation in :func:`_traverse_reduce`. For each sample it
+    builds an exclusive prefix of the present-taxon indicator, then sums each
+    node's branch length iff that node's descendant-taxa range ``[lo, hi)``
+    contains a present taxon.
+
+    Parameters
+    ----------
+    presence : memoryview of uint8, shape (n_samples, n_taxa)
+        Present-taxon indicator, already reordered into ascending tip order.
+    lo, hi : memoryview of int32, shape (n_nodes,)
+        Half-open descendant-taxa bounds of each node in that column space.
+    lengths : memoryview of double, shape (n_nodes,)
+        Branch length of each node.
+    pref : memoryview of int32, shape (n_samples, n_taxa + 1)
+        Caller-allocated scratch for the per-sample prefix, indexed by the
+        loop variable (never by thread id, so no OpenMP runtime is required).
+    out : memoryview of double, shape (n_samples,)
+        Faith's PD per sample; written in place.
+    """
+    cdef:
+        Py_ssize_t s, j, k
+        Py_ssize_t n_samples = presence.shape[0]
+        Py_ssize_t n_taxa = presence.shape[1]
+        Py_ssize_t n_nodes = lengths.shape[0]
+        double acc
+
+    for s in prange(n_samples, nogil=True):
+        pref[s, 0] = 0
+        for j in range(n_taxa):
+            pref[s, j + 1] = pref[s, j] + presence[s, j]
+        acc = 0.0
+        for k in range(n_nodes):
+            if pref[s, hi[k]] - pref[s, lo[k]] > 0:
+                acc = acc + lengths[k]
+        out[s] = acc
