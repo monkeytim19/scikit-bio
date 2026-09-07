@@ -412,6 +412,36 @@ class FaithPDBPTreeEngineTests(TestCase):
         self.assertAlmostEqual(got, faith_pd(self.b1[0], self.oids1, self.t1),
                                places=10)
 
+    def test_degenerate_shapes(self):
+        # shapes that make the compacted range space empty or ragged: no taxa
+        # at all (every node's [lo, hi) collapses), a single taxon, and a taxa
+        # count that is not a multiple of the GPU block width.
+        bp = BPTree.from_treenode(self.t1)
+        for eng in _BP_ENGINES:
+            self.assertAlmostEqual(
+                faith_pd(np.array([], dtype=int), np.array([], dtype=int), bp,
+                         engine=eng),
+                0.0, places=10, msg=eng)
+            self.assertAlmostEqual(
+                faith_pd([1], ["OTU1"], bp, engine=eng),
+                faith_pd([1], ["OTU1"], self.t1), places=10, msg=eng)
+        # a tree wide enough that n_taxa straddles the 256-thread block width,
+        # kept bifurcating at the root so it passes the rooted check
+        half = [TreeNode(children=[
+            TreeNode(name="w%d" % i, length=0.5 + i * 0.001)
+            for i in range(lo, hi)], length=0.25)
+            for lo, hi in ((0, 150), (150, 300))]
+        wide = TreeNode(children=half)
+        wide.length = 0.0
+        wide_bp = BPTree.from_treenode(wide)
+        names = ["w%d" % i for i in range(300)]
+        counts = (np.arange(300) % 3 == 0).astype(int)
+        ref = faith_pd(counts, names, wide)
+        for eng in _BP_ENGINES:
+            self.assertAlmostEqual(
+                faith_pd(counts, names, wide_bp, engine=eng), ref, places=10,
+                msg=eng)
+
     @numba_code
     def test_gpu_engine_falls_back_without_a_device(self):
         # engine="gpu" on a machine with no usable device must not raise: the

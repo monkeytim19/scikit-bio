@@ -50,13 +50,17 @@ _unavailable = set()
 # backend name -> compiled kernel table, built once
 _kernels = {}
 
-# id(host array) -> device array, for the index arrays. _setup_pd_bp hands back
-# freshly built lo/hi/lengths per call, but a caller looping over count matrices
-# with one tree reuses them, so memoizing by identity turns those into one
-# upload. The host arrays are kept alive in _keepalive because an id() is only
-# meaningful for as long as its object is.
-_device = {}
-_keepalive = []
+# Device copies of the index arrays for the most recent (lo, hi, lengths).
+#
+# Deliberately a *single* entry. Memoizing every triple ever seen would grow
+# without limit, because _setup_pd_bp builds these fresh on every call -- three
+# arrays per call, held on both sides, forever. One entry still spares the case
+# that actually repeats: a caller looping over count matrices against one tree,
+# reusing the arrays one setup produced.
+#
+# The host arrays are held in "host" as well, so their id()s cannot be recycled
+# by a later array while the key that names them is still live.
+_index_cache = {"key": None, "host": None, "dev": None}
 
 
 def _numba_gpu_module():
@@ -193,21 +197,26 @@ def _build_kernels(gpu):
     return {"scan": _scan_k, "reduce": _reduce_k}
 
 
-def _upload(gpu, arr):
-    """Return a device copy of ``arr``, reusing one made for the same object."""
-    key = id(arr)
-    dev = _device.get(key)
-    if dev is None:
-        dev = gpu.to_device(np.ascontiguousarray(arr))
-        _device[key] = dev
-        _keepalive.append(arr)
-    return dev
+def _upload_index(gpu, lo, hi, lengths):
+    """Return device copies of the index arrays, reusing the previous triple."""
+    key = (id(lo), id(hi), id(lengths))
+    if _index_cache["key"] != key:
+        # drop the old entry first so its device buffers are freed before the
+        # replacements are allocated
+        _reset()
+        _index_cache["host"] = (lo, hi, lengths)
+        _index_cache["dev"] = tuple(
+            gpu.to_device(np.ascontiguousarray(a)) for a in (lo, hi, lengths)
+        )
+        _index_cache["key"] = key
+    return _index_cache["dev"]
 
 
 def _reset():
-    """Drop every cached device buffer. Used when a backend is abandoned."""
-    _device.clear()
-    _keepalive.clear()
+    """Drop the cached device buffers. Used when a backend is abandoned."""
+    _index_cache["key"] = None
+    _index_cache["dev"] = None
+    _index_cache["host"] = None
 
 
 def _prepare():
@@ -269,8 +278,7 @@ def run_faith_pd_gpu(presence, lo, hi, lengths, out, timings=None):
         chunk = min(n_samples, max(1, _MAX_PREF_BYTES // ((n_taxa + 1) * 4)))
 
         t0 = perf_counter()
-        d_lo, d_hi = _upload(gpu, lo), _upload(gpu, hi)
-        d_len = _upload(gpu, lengths)
+        d_lo, d_hi, d_len = _upload_index(gpu, lo, hi, lengths)
         _tick("upload", t0)
 
         d_pref = gpu.device_array((chunk, n_taxa + 1), dtype=np.int32)
