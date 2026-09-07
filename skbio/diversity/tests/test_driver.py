@@ -25,8 +25,9 @@ from skbio.diversity import (
     get_beta_diversity_metrics,
 )
 from skbio.diversity.alpha import faith_pd, phydiv, sobs
+from skbio.diversity.alpha._pd import NUMBA_AVAILABLE
 from skbio.diversity.beta import unweighted_unifrac, weighted_unifrac
-from skbio.tree import DuplicateNodeError, MissingNodeError
+from skbio.tree import BPTree, DuplicateNodeError, MissingNodeError
 from skbio.diversity._driver import (
     _qualitative_metrics,
     _pdist_metrics,
@@ -53,6 +54,28 @@ class AlphaDiversityTests(TestCase):
         self.tree2 = TreeNode.read(io.StringIO(
             '(((((OTU1:42.5,OTU2:0.5):0.5,OTU3:1.0):1.0):'
             '0.0,(OTU4:0.75,OTU5:0.0001):1.25):0.0)root;'))
+
+    def test_faith_pd_bptree_engines(self):
+        # faith_pd on a BPTree goes through the whole-vector fast path and
+        # matches the TreeNode result elementwise (index + dtype) per engine.
+        engines = ["cython"] + (["numba"] if NUMBA_AVAILABLE else [])
+        ref = alpha_diversity('faith_pd', self.table1, self.sids1,
+                              taxa=self.oids1, tree=self.tree1)
+        bp = BPTree.from_treenode(self.tree1)
+        for eng in engines:
+            got = alpha_diversity('faith_pd', self.table1, self.sids1,
+                                  taxa=self.oids1, tree=bp, engine=eng)
+            assert_series_almost_equal(ref, got)
+
+    def test_faith_pd_treenode_engine_warns_and_falls_back(self):
+        if not NUMBA_AVAILABLE:
+            self.skipTest('numba not installed')
+        ref = alpha_diversity('faith_pd', self.table1, self.sids1,
+                              taxa=self.oids1, tree=self.tree1)
+        with self.assertWarnsRegex(UserWarning, 'BPTree'):
+            got = alpha_diversity('faith_pd', self.table1, self.sids1,
+                                  taxa=self.oids1, tree=self.tree1, engine='numba')
+        assert_series_almost_equal(ref, got)
 
     def test_invalid_input(self):
         # number of ids doesn't match the number of samples

@@ -15,8 +15,13 @@ import pandas as pd
 
 from skbio import TreeNode
 from skbio.util import get_data_path
-from skbio.tree import DuplicateNodeError, MissingNodeError
+from skbio.tree import BPTree, DuplicateNodeError, MissingNodeError
+from skbio.diversity import alpha_diversity
 from skbio.diversity.alpha import faith_pd, phydiv
+from skbio.diversity.alpha._pd import NUMBA_AVAILABLE
+
+# engines to exercise; numba only if the optional dependency is importable
+_BP_ENGINES = ["cython"] + (["numba"] if NUMBA_AVAILABLE else [])
 
 
 class FaithPDTests(TestCase):
@@ -216,6 +221,225 @@ class FaithPDTests(TestCase):
         counts = [1, 2, 3]
         taxa = ['OTU1', 'OTU2', 'OTU42']
         self.assertRaises(MissingNodeError, faith_pd, counts, taxa, t)
+
+
+class FaithPDBPTreeEngineTests(TestCase):
+    """faith_pd over a BPTree, across the cython and numba engines, must agree
+    with the TreeNode reference and preserve its error behavior."""
+
+    def setUp(self):
+        self.oids1 = ["OTU%d" % i for i in range(1, 6)]
+        self.t1 = TreeNode.read(
+            StringIO(
+                "(((((OTU1:0.5,OTU2:0.5):0.5,OTU3:1.0):1.0):"
+                "0.0,(OTU4:0.75,OTU5:0.75):1.25):0.0)root;"
+            )
+        )
+        self.b1 = np.array(
+            [
+                [1, 3, 0, 1, 0],
+                [0, 2, 0, 4, 4],
+                [0, 0, 6, 2, 1],
+                [0, 0, 1, 1, 1],
+                [2, 0, 3, 0, 0],
+            ]
+        )
+
+    def _assert_match(self, counts, taxa, tree, **kw):
+        ref = faith_pd(counts, taxa, tree, **kw)
+        bp = BPTree.from_treenode(tree)
+        for eng in _BP_ENGINES:
+            got = faith_pd(counts, taxa, bp, engine=eng, **kw)
+            self.assertAlmostEqual(got, ref, places=10, msg="engine=%s" % eng)
+        return ref
+
+    # --- topology builders (rooted, bifurcating, all branches have length) ---
+    @staticmethod
+    def _balanced(n):
+        nodes = [TreeNode(name="t%d" % i, length=1.0) for i in range(n)]
+        while len(nodes) > 1:
+            nxt = [
+                TreeNode(children=[nodes[i], nodes[i + 1]], length=1.0)
+                for i in range(0, len(nodes) - 1, 2)
+            ]
+            if len(nodes) % 2:
+                nxt.append(nodes[-1])
+            nodes = nxt
+        nodes[0].length = 0.0
+        return nodes[0]
+
+    @staticmethod
+    def _caterpillar(n):
+        node = TreeNode(
+            children=[TreeNode(name="t0", length=1.0), TreeNode(name="t1", length=1.0)],
+            length=1.0,
+        )
+        for i in range(2, n):
+            node = TreeNode(
+                children=[node, TreeNode(name="t%d" % i, length=1.0)], length=1.0
+            )
+        node.length = 0.0
+        return node
+
+    @staticmethod
+    def _random(n, rng):
+        nodes = [
+            TreeNode(name="t%d" % i, length=round(float(rng.uniform(0.1, 1.0)), 3))
+            for i in range(n)
+        ]
+        while len(nodes) > 1:
+            a = nodes.pop(int(rng.integers(0, len(nodes))))
+            b = nodes.pop(int(rng.integers(0, len(nodes))))
+            nodes.append(
+                TreeNode(
+                    children=[a, b], length=round(float(rng.uniform(0.1, 1.0)), 3)
+                )
+            )
+        nodes[0].length = 0.0
+        return nodes[0]
+
+    def test_engines_match_reference(self):
+        for row in self.b1:
+            self._assert_match(row, self.oids1, self.t1)
+            self._assert_match(row, self.oids1, self.t1, validate=False)
+        # none / all / one observed
+        self._assert_match([0, 0, 0, 0, 0], self.oids1, self.t1)
+        self._assert_match([1, 1, 1, 1, 1], self.oids1, self.t1)
+        self._assert_match([1, 0, 0, 0, 0], self.oids1, self.t1)
+
+    def test_extra_tips(self):
+        # tree tips are a superset of taxa
+        t = TreeNode.read(
+            StringIO(
+                "(((((OTU1:0.5,OTU2:0.5):0.5,OTU3:1.0):1.0):0.0,(OTU4:"
+                "0.75,(OTU5:0.25,(OTU6:0.5,OTU7:0.5):0.5):0.5):1.25):0.0)root;"
+            )
+        )
+        for row in self.b1:
+            self._assert_match(row, self.oids1, t)
+
+    def test_root_not_observed(self):
+        tree = TreeNode.read(
+            StringIO("((OTU1:0.1, OTU2:0.2):0.3, (OTU3:0.5, OTU4:0.7):1.1)root;")
+        )
+        taxa = ["OTU%d" % i for i in range(1, 5)]
+        self.assertAlmostEqual(self._assert_match([1, 1, 0, 0], taxa, tree), 0.6)
+        self.assertAlmostEqual(self._assert_match([0, 0, 1, 1], taxa, tree), 2.3)
+
+    def test_topologies_and_subset(self):
+        rng = np.random.default_rng(42)
+        trees = [self._balanced(64), self._caterpillar(50), self._random(300, rng)]
+        for tree in trees:
+            tips = [t.name for t in tree.tips()]
+            # all tips
+            self._assert_match(rng.integers(0, 4, len(tips)), tips, tree)
+            # strict subset of tips (exercises the searchsorted compaction)
+            k = max(2, len(tips) // 2)
+            sub = list(rng.choice(tips, k, replace=False))
+            self._assert_match(rng.integers(0, 4, k), sub, tree)
+            # sparse
+            self._assert_match(
+                (rng.random(len(tips)) < 0.1).astype(int), tips, tree
+            )
+
+    def test_alpha_diversity_engines(self):
+        ref = alpha_diversity(
+            "faith_pd", self.b1, ids=list("ABCDE"), taxa=self.oids1, tree=self.t1
+        )
+        bp = BPTree.from_treenode(self.t1)
+        for eng in _BP_ENGINES:
+            got = alpha_diversity(
+                "faith_pd", self.b1, ids=list("ABCDE"), taxa=self.oids1,
+                tree=bp, engine=eng,
+            )
+            pd.testing.assert_series_equal(ref, got)
+
+    def test_treenode_noncython_engine_warns_and_falls_back(self):
+        # an explicit non-cython engine on a TreeNode warns once and returns
+        # the cython answer (faith_pd and alpha_diversity)
+        ref = faith_pd(self.b1[0], self.oids1, self.t1)
+        with self.assertWarnsRegex(UserWarning, "BPTree"):
+            got = faith_pd(self.b1[0], self.oids1, self.t1, engine="numba")
+        self.assertAlmostEqual(got, ref, places=10)
+        with self.assertWarnsRegex(UserWarning, "BPTree"):
+            got = alpha_diversity(
+                "faith_pd", self.b1, taxa=self.oids1, tree=self.t1, engine="numba"
+            )
+        pd.testing.assert_series_equal(
+            alpha_diversity("faith_pd", self.b1, taxa=self.oids1, tree=self.t1), got
+        )
+
+    def test_unsupported_engine_rejected(self):
+        bp = BPTree.from_treenode(self.t1)
+        with self.assertRaises(ValueError):
+            faith_pd(self.b1[0], self.oids1, bp, engine="gpu")
+
+    def test_error_parity(self):
+        for eng in _BP_ENGINES:
+            # duplicated tip ids -> DuplicateNodeError
+            t = TreeNode.read(
+                StringIO(
+                    "(((((OTU1:0.5,OTU2:0.5):0.5,OTU3:1.0):1.0):0.0,(OTU4:"
+                    "0.75,OTU2:0.75):1.25):0.0)root;"
+                )
+            )
+            self.assertRaises(
+                DuplicateNodeError, faith_pd, [1, 2, 3], ["OTU1", "OTU2", "OTU3"],
+                BPTree.from_treenode(t), engine=eng,
+            )
+            # unrooted (trifurcating root) -> ValueError
+            t = TreeNode.read(
+                StringIO("((OTU1:0.1, OTU2:0.2):0.3, OTU3:0.5, OTU4:0.7)root;")
+            )
+            self.assertRaises(
+                ValueError, faith_pd, [1, 2, 3], ["OTU1", "OTU2", "OTU3"],
+                BPTree.from_treenode(t), engine=eng,
+            )
+            good = TreeNode.read(
+                StringIO(
+                    "(((((OTU1:0.5,OTU2:0.5):0.5,OTU3:1.0):1.0):0.0,(OTU4:"
+                    "0.75,OTU5:0.75):1.25):0.0)root;"
+                )
+            )
+            bp = BPTree.from_treenode(good)
+            # duplicated taxa ids -> ValueError
+            self.assertRaises(
+                ValueError, faith_pd, [1, 2, 3], ["OTU1", "OTU2", "OTU2"], bp,
+                engine=eng,
+            )
+            # length mismatch -> ValueError
+            self.assertRaises(
+                ValueError, faith_pd, [1, 2], ["OTU1", "OTU2", "OTU3"], bp, engine=eng
+            )
+            # negative counts -> ValueError
+            self.assertRaises(
+                ValueError, faith_pd, [1, 2, -3], ["OTU1", "OTU2", "OTU3"], bp,
+                engine=eng,
+            )
+            # taxa not present in tree -> MissingNodeError
+            self.assertRaises(
+                MissingNodeError, faith_pd, [1, 2, 3], ["OTU1", "OTU2", "OTU42"], bp,
+                engine=eng,
+            )
+
+    def test_missing_length_is_a_known_divergence(self):
+        # BPTree collapses a missing branch length to 0.0 at construction, so
+        # unlike the TreeNode path it CANNOT reject a missing-length tree; it
+        # computes with the 0.0 lengths instead. This documents that gap.
+        t = TreeNode.read(
+            StringIO(
+                "(((((OTU1,OTU2:0.5):0.5,OTU3:1.0):1.0):0.0,(OTU4:"
+                "0.75,OTU5:0.75):1.25):0.0)root;"
+            )
+        )
+        # TreeNode path rejects it ...
+        self.assertRaises(
+            ValueError, faith_pd, [1, 2, 3], ["OTU1", "OTU2", "OTU3"], t
+        )
+        # ... the BPTree path does not (missing length is already 0.0)
+        bp = BPTree.from_treenode(t)
+        val = faith_pd([1, 2, 3], ["OTU1", "OTU2", "OTU3"], bp)
+        self.assertTrue(np.isfinite(val))
 
 
 class PhyDivTests(TestCase):
