@@ -6,8 +6,11 @@
 # The full license is in the file LICENSE.txt, distributed with this software.
 # ----------------------------------------------------------------------------
 
+import warnings
+
 import numpy as np
 
+from skbio._config import _resolve_engine
 from skbio.diversity._util import (
     _validate_counts_vector,
     vectorize_counts_and_tree,
@@ -175,6 +178,27 @@ if NUMBA_AVAILABLE:
         return out
 
 
+def _faith_pd_bp_run(counts, taxa, tree, validate, engine, single_sample):
+    """Set up and dispatch Faith's PD over a ``BPTree`` to the chosen engine.
+
+    Returns a scalar for a single sample, otherwise a ``(n_samples,)`` vector.
+    ``engine`` is assumed already resolved (so ``"numba"`` implies numba is
+    importable).
+    """
+    perm, lo, hi, lengths = _setup_pd_bp(
+        counts, taxa, tree, validate, single_sample=single_sample
+    )
+    # Compare before gathering so the reorder moves one byte per element.
+    presence = np.ascontiguousarray(
+        np.greater(np.atleast_2d(counts), 0)[:, perm], dtype=np.uint8
+    )
+    if engine == "numba":
+        out = _faith_pd_bp_nb(presence, lo, hi, lengths)
+    else:
+        out = _faith_pd_bp_cython(presence, lo, hi, lengths)
+    return out[0] if single_sample else out
+
+
 def _faith_pd(counts_by_node, branch_lengths):
     """Calculate Faith's phylogenetic diversity (Faith's PD) metric.
 
@@ -195,7 +219,7 @@ def _faith_pd(counts_by_node, branch_lengths):
 
 
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
-def faith_pd(counts, taxa, tree, validate=True):
+def faith_pd(counts, taxa, tree, validate=True, engine=None):
     r"""Calculate Faith's phylogenetic diversity (Faith's PD) metric.
 
     The Faith's PD metric is defined as:
@@ -216,9 +240,10 @@ def faith_pd(counts, taxa, tree, validate=True):
     taxa : list, np.array
         Vector of taxon IDs corresponding to tip names in ``tree``. Must be the same
         length as ``counts``. Required.
-    tree : skbio.TreeNode
+    tree : skbio.TreeNode or skbio.tree.BPTree
         Tree relating taxa. The set of tip names in the tree can be a superset of
-        ``taxa``, but not a subset. Required.
+        ``taxa``, but not a subset. A :class:`~skbio.tree.BPTree` unlocks the
+        ``engine`` acceleration described below. Required.
     validate : bool, optional
         Whether validate the input data (default: True). This step can be slow, so if
         validation is run elsewhere it can be disabled here. However, invalid input
@@ -226,6 +251,12 @@ def faith_pd(counts, taxa, tree, validate=True):
         so this step should not be bypassed if you're not certain that your input data
         are valid. See :mod:`skbio.diversity` for the description of what validation
         entails so you can determine if you can safely disable validation.
+    engine : str, optional
+        Compute engine for a :class:`~skbio.tree.BPTree` input: ``"cython"``
+        (default) or ``"numba"`` (requires the optional ``numba`` package). It is
+        ignored for :class:`~skbio.TreeNode` input, where a non-default engine
+        emits a warning and the cython path is used. Defaults to the global
+        ``engine`` configuration option.
 
     Returns
     -------
@@ -325,6 +356,15 @@ def faith_pd(counts, taxa, tree, validate=True):
     6.95
 
     """
+    engine = _resolve_engine(engine, ("cython", "numba"))
+    if isinstance(tree, BPTree):
+        return _faith_pd_bp_run(counts, taxa, tree, validate, engine, True)
+    if engine != "cython":
+        warnings.warn(
+            f"engine={engine!r} is only available for BPTree input; the "
+            "TreeNode path uses the cython engine.",
+            stacklevel=2,
+        )
     counts_by_node, branch_lengths = _setup_pd(
         counts, taxa, tree, validate, rooted=True, single_sample=True
     )

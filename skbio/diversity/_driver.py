@@ -17,14 +17,21 @@ from typing import Any, TYPE_CHECKING
 import numpy as np
 import pandas as pd
 
+from skbio._config import _resolve_engine
 from skbio.diversity import alpha
-from skbio.diversity.alpha._pd import _setup_pd, _faith_pd, _phydiv
+from skbio.diversity.alpha._pd import (
+    _setup_pd,
+    _faith_pd,
+    _phydiv,
+    _faith_pd_bp_run,
+)
 from skbio.diversity.beta._unifrac import (
     _setup_multiple_unweighted_unifrac,
     _setup_multiple_weighted_unifrac,
     _normalize_weighted_unifrac_by_default,
 )
 from skbio.stats.distance import DistanceMatrix
+from skbio.tree import BPTree
 from skbio.diversity._util import (
     _validate_counts_matrix,
     _get_phylogenetic_kwargs,
@@ -131,11 +138,32 @@ def get_beta_diversity_metrics() -> list[str]:
     return sorted(_pdist_metrics.union(["unweighted_unifrac", "weighted_unifrac"]))
 
 
+def _faith_pd_bp_fast_path_eligible(tree, resolved_engine):
+    """Whether the array-native ``BPTree`` fast path can serve ``faith_pd``.
+
+    Mirrors :func:`_numba_unifrac_fast_path_eligible`: any :class:`BPTree` is
+    eligible (for both the cython and numba engines, which compute the whole
+    vector directly and bypass the per-sample loop). A non-cython engine
+    explicitly resolved on a :class:`~skbio.TreeNode` warns and falls back, so
+    the request stays visible.
+    """
+    if isinstance(tree, BPTree):
+        return True
+    if resolved_engine != "cython":
+        warnings.warn(
+            f"engine={resolved_engine!r} is only available for BPTree input; "
+            "the TreeNode path uses the cython engine.",
+            stacklevel=3,
+        )
+    return False
+
+
 def alpha_diversity(
     metric: str | Callable,
     counts: TableLike,
     ids: ArrayLike | None = None,
     validate: bool = True,
+    engine: str | None = None,
     **kwargs: Any,
 ) -> pd.Series:
     r"""Compute alpha diversity for one or more samples.
@@ -157,6 +185,13 @@ def alpha_diversity(
     validate: bool, optional
         If True (default), validate the input data before applying the alpha diversity
         metric. See :mod:`skbio.diversity` for the details of validation.
+    engine : str, optional
+        Compute engine for ``faith_pd`` when ``tree`` is a
+        :class:`~skbio.tree.BPTree`: ``"cython"`` (default) or ``"numba"``
+        (requires the optional ``numba`` package). The whole vector is computed in
+        one call, bypassing the per-sample loop. Ignored for other metrics and for
+        :class:`~skbio.TreeNode` input, where a non-default engine warns. Defaults
+        to the global ``engine`` configuration option.
     kwargs : dict, optional
         Metric-specific parameters. Refer to the documentation of the chosen metric.
         A special parameter is ``taxa``, needed by some phylogenetic metrics. If not
@@ -192,6 +227,16 @@ def alpha_diversity(
     if metric in ("faith_pd", "phydiv"):
         taxa, tree, kwargs = _get_phylogenetic_kwargs(kwargs, taxa)
         is_faith_pd = metric == "faith_pd"
+        if is_faith_pd:
+            resolved_engine = _resolve_engine(engine, ("cython", "numba"))
+            if _faith_pd_bp_fast_path_eligible(tree, resolved_engine):
+                # Compute the whole vector in one engine call: no
+                # (n_samples, n_nodes) counts_by_node matrix and no per-sample
+                # Python loop.
+                result = _faith_pd_bp_run(
+                    counts, taxa, tree, validate, resolved_engine, False
+                )
+                return pd.Series(result, index=ids)
         counts, lengths = _setup_pd(
             counts, taxa, tree, validate, rooted=is_faith_pd, single_sample=False
         )
