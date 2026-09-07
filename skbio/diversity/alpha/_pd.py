@@ -43,14 +43,16 @@ def _setup_pd(counts, taxa, tree, validate, rooted, single_sample):
     return counts_by_node, branch_lengths
 
 
-def _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths):
-    """Validate taxa and a ``BPTree`` prior to Faith's PD.
+def _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths, rooted=True):
+    """Validate taxa and a ``BPTree`` prior to a phylogenetic diversity metric.
 
     The ``BPTree`` twin of :func:`~skbio.tree._utils._validate_taxa_and_tree`,
     which is TreeNode-only (it calls ``tree.root().children`` and
     ``tree.tips()``). Checks run against the arrays returned by
     :meth:`BPTree._to_tip_range_arrays` plus a root-degree check via BP
-    navigation.
+    navigation. ``rooted`` mirrors the TreeNode validator: rooted metrics
+    (Faith's PD) require a bifurcating root, while unrooted ones (``phydiv``
+    with ``rooted=False``) accept any root degree.
 
     Notes
     -----
@@ -61,15 +63,17 @@ def _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths):
     if len(taxa) != len(set(taxa)):
         raise ValueError("All taxa must be unique.")
 
-    # rooted: the root has at most two children
-    root = tree.root()
-    child = tree.first_child(root)
-    n_root_children = 0
-    while child != 0:
-        n_root_children += 1
-        child = tree.next_sibling(child)
-    if n_root_children > 2:
-        raise ValueError("The tree must be rooted.")
+    # rooted metrics require the root to have at most two children; unrooted
+    # ones (phydiv, rooted=False) impose no root-degree constraint
+    if rooted:
+        root = tree.root()
+        child = tree.first_child(root)
+        n_root_children = 0
+        while child != 0:
+            n_root_children += 1
+            child = tree.next_sibling(child)
+        if n_root_children > 2:
+            raise ValueError("The tree must be rooted.")
 
     # non-root nodes must have a branch length (lengths[0] is the root)
     if np.isnan(lengths[1:]).any():
@@ -85,7 +89,7 @@ def _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths):
         )
 
 
-def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
+def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True, rooted=True):
     """Validate and build compacted tip-range index arrays for a ``BPTree``.
 
     The ``BPTree`` twin of :func:`_setup_pd`. Rather than materializing the
@@ -112,7 +116,7 @@ def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
             counts = _validate_counts_vector(counts)
             if counts.size != len(taxa):
                 raise ValueError("`taxa` must be the same length as `counts`.")
-        _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths)
+        _validate_taxa_and_tree_bp(taxa, tree, tip_names, lengths, rooted=rooted)
 
     # Map each taxon to its tip rank, then compact the (full) node tip-ranges
     # onto the taxa columns via a single sort + two searchsorted lookups.
@@ -198,6 +202,35 @@ def _presence_in_tip_order(counts, perm):
     """
     # bool and uint8 are both one byte, so the view is a free reinterpretation
     return np.take(np.greater(np.atleast_2d(counts), 0), perm, axis=1).view(np.uint8)
+
+
+def _counts_in_tip_order(counts, perm):
+    """Reorder ``counts`` into tip order as a C-contiguous float64 matrix.
+
+    The abundance counterpart of :func:`_presence_in_tip_order`: ``phydiv``'s
+    weighted modes need the counts themselves, not just presence. The counts
+    are first truncated to ``int64`` -- the ``TreeNode`` path fills an
+    ``int64`` ``counts_by_node`` (via :func:`vectorize_counts_and_tree`), so any
+    non-integer input is truncated there, and matching that keeps the two paths
+    bit-identical (the resulting float64 prefix is then exact, being
+    integer-valued). ``np.take(..., axis=1)`` writes a C-contiguous result
+    directly (see :func:`_presence_in_tip_order` for why that matters).
+
+    Parameters
+    ----------
+    counts : array_like of shape (n_samples, n_taxa) or (n_taxa,)
+        Counts/abundances, in ``taxa`` order.
+    perm : ndarray of int32 of shape (n_taxa,)
+        Reorders the ``taxa`` columns into ascending tip order.
+
+    Returns
+    -------
+    ndarray of float64 of shape (n_samples, n_taxa)
+        C-contiguous abundances (integer-valued) in tip order.
+
+    """
+    reordered = np.take(np.atleast_2d(counts), perm, axis=1)
+    return reordered.astype(np.int64).astype(np.float64)
 
 
 def _faith_pd_bp_cython(presence, lo, hi, lengths, max_bytes=64 * 1024 * 1024):
@@ -503,8 +536,168 @@ def _phydiv(counts_by_node, branch_lengths, rooted, weight):
     return (branch_lengths * fracs_by_node).sum()
 
 
+#: Engines ``phydiv`` accepts for a ``BPTree``. Unlike Faith's PD
+#: (:data:`_BP_PD_ENGINES`), the GPU kernels are deferred, so ``"gpu"`` is not
+#: offered yet -- see the seam in :func:`_phydiv_bp_run`.
+_PHYDIV_BP_ENGINES = ("cython", "numba")
+
+
+def _resolve_phydiv_bp_engine(engine):
+    """Resolve an engine name for ``phydiv`` over a ``BPTree``.
+
+    Only ``"cython"`` and ``"numba"`` are offered for now; the GPU kernels are
+    deferred (see the seam in :func:`_phydiv_bp_run`), so ``engine="gpu"`` is
+    rejected here rather than silently downgraded.
+    """
+    return _resolve_engine(engine, _PHYDIV_BP_ENGINES)
+
+
+def _bp_is_rooted(tree):
+    """Whether a ``BPTree``'s root has exactly two children.
+
+    The ``BPTree`` analog of ``TreeNode._is_rooted``, used to default
+    ``phydiv``'s ``rooted``. Counts the root's children via BP navigation -- the
+    same walk :func:`_validate_taxa_and_tree_bp` performs.
+    """
+    root = tree.root()
+    child = tree.first_child(root)
+    n = 0
+    while child != 0:
+        n += 1
+        child = tree.next_sibling(child)
+    return n == 2
+
+
+def _validate_phydiv_weight(weight):
+    """Validate ``phydiv``'s ``weight``: a Boolean or a float within [0, 1]."""
+    if (
+        not isinstance(weight, (bool, int, float))
+        or (w_ := float(weight)) < 0.0
+        or w_ > 1.0
+    ):
+        raise ValueError("Weight parameter must be Boolean or within [0, 1].")
+
+
+def _phydiv_weight_params(weight):
+    """Map ``phydiv``'s ``weight`` onto the kernel's ``(weighted, theta)``.
+
+    Faithful to :func:`_phydiv`: a falsy ``weight`` is unweighted; a float in
+    ``(0, 1)`` is partial weighting with that exponent; anything else truthy
+    (``True``, ``1``, ``1.0``) is fully weighted, so ``theta = 1.0`` and the
+    kernel skips the ``pow``.
+    """
+    weighted = bool(weight)
+    if isinstance(weight, float) and weight < 1.0:
+        theta = float(weight)
+    else:
+        theta = 1.0
+    return weighted, theta
+
+
+def _phydiv_bp_cython(
+    counts_tip, lo, hi, lengths, rooted, weighted, theta, max_bytes=64 * 1024 * 1024
+):
+    """Chunked driver for the OpenMP ``_phydiv_bp`` cython kernel.
+
+    Mirrors :func:`_faith_pd_bp_cython` but the prefix scratch is float64 (the
+    abundance prefix ``phydiv`` needs), so the per-sample row is eight bytes per
+    taxon when sizing the chunk against the byte budget.
+    """
+    from skbio.diversity._phylogenetic import _phydiv_bp
+
+    n_samples, n_taxa = counts_tip.shape
+    out = np.empty(n_samples, dtype=np.float64)
+    chunk = max(1, max_bytes // ((n_taxa + 1) * 8))
+    pref = np.empty((min(chunk, n_samples), n_taxa + 1), dtype=np.float64)
+    for start in range(0, n_samples, chunk):
+        stop = min(start + chunk, n_samples)
+        _phydiv_bp(
+            counts_tip[start:stop],
+            lo,
+            hi,
+            lengths,
+            pref[: stop - start],
+            rooted,
+            weighted,
+            theta,
+            out[start:stop],
+        )
+    return out
+
+
+if NUMBA_AVAILABLE:
+
+    @njit(parallel=True)
+    def _phydiv_bp_nb(counts_tip, lo, hi, lengths, rooted, weighted, theta):
+        """Numba-parallel counterpart of the ``_phydiv_bp`` cython kernel.
+
+        Each sample gets its own float64 prefix buffer inside the ``parfor``, so
+        no caller-supplied scratch is needed.
+        """
+        n_samples = counts_tip.shape[0]
+        n_taxa = counts_tip.shape[1]
+        n_nodes = lengths.shape[0]
+        out = np.zeros(n_samples, np.float64)
+        for s in prange(n_samples):
+            pref = np.empty(n_taxa + 1, np.float64)
+            pref[0] = 0.0
+            for j in range(n_taxa):
+                pref[j + 1] = pref[j] + counts_tip[s, j]
+            total = pref[n_taxa]
+            if total == 0.0:
+                out[s] = 0.0
+            else:
+                acc = 0.0
+                for k in range(n_nodes):
+                    cbn = pref[hi[k]] - pref[lo[k]]
+                    if not weighted:
+                        if rooted:
+                            if cbn > 0.0:
+                                acc += lengths[k]
+                        else:
+                            if cbn > 0.0 and cbn < total:
+                                acc += lengths[k]
+                    else:
+                        f = cbn / total
+                        if not rooted:
+                            g = 1.0 - f
+                            if g < f:
+                                f = g
+                            f = 2.0 * f
+                        if theta < 1.0:
+                            f = f**theta
+                        acc += lengths[k] * f
+                out[s] = acc
+        return out
+
+
+def _phydiv_bp_run(counts, taxa, tree, validate, engine, rooted, weight, single_sample):
+    """Set up and dispatch ``phydiv`` over a ``BPTree`` to the chosen engine.
+
+    Returns a scalar for a single sample, otherwise a ``(n_samples,)`` vector.
+    ``engine`` is assumed already resolved, and ``rooted``/``weight`` already
+    defaulted and validated by the caller.
+    """
+    # phydiv never requires a bifurcating root (the TreeNode path always
+    # validates with rooted=False); the metric's own rooted mode is applied in
+    # the kernel, not the validator.
+    perm, lo, hi, lengths = _setup_pd_bp(
+        counts, taxa, tree, validate, single_sample=single_sample, rooted=False
+    )
+    counts_tip = _counts_in_tip_order(counts, perm)
+    weighted, theta = _phydiv_weight_params(weight)
+    # GPU seam: a future ``if engine == "gpu": from ._phydiv_gpu import ...``
+    # block belongs here, mirroring _faith_pd_bp_run. Deferred for now, so
+    # _resolve_phydiv_bp_engine offers only cython/numba.
+    if engine == "numba":
+        out = _phydiv_bp_nb(counts_tip, lo, hi, lengths, rooted, weighted, theta)
+    else:
+        out = _phydiv_bp_cython(counts_tip, lo, hi, lengths, rooted, weighted, theta)
+    return out[0] if single_sample else out
+
+
 @params_aliased([("taxa", "otu_ids", "0.6.0", True)])
-def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
+def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True, engine=None):
     r"""Calculate generalized phylogenetic diversity (PD) metrics.
 
     Parameters
@@ -514,9 +707,10 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
     taxa : list, np.array
         Vector of taxon IDs corresponding to tip names in ``tree``. Must be the same
         length as ``counts``. Required.
-    tree : skbio.TreeNode
+    tree : skbio.TreeNode or skbio.tree.BPTree
         Tree relating taxa. The set of tip names in the tree can be a superset of
-        ``taxa``, but not a subset. Required.
+        ``taxa``, but not a subset. A :class:`~skbio.tree.BPTree` unlocks the
+        ``engine`` acceleration described below. Required.
     rooted : bool, optional
         Whether the metric is calculated considering the root of the tree. By default,
         this will be determined based on whether the input tree is rooted. However, one
@@ -527,6 +721,13 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
         the degree of partial-weighting (0: unweighted, 1: fully-weighted).
     validate : bool, optional
         Whether validate the input data. See :func:`faith_pd` for details.
+    engine : str, optional
+        Compute engine when ``tree`` is a :class:`~skbio.tree.BPTree`:
+        ``"cython"`` (default) or ``"numba"`` (requires the optional ``numba``
+        package). Both compute the metric over the tree's compacted tip-range
+        arrays, bypassing the ``(n_samples, n_nodes)`` ``counts_by_node`` matrix.
+        Ignored for :class:`~skbio.TreeNode` input, where a non-default engine
+        warns. Defaults to the global ``engine`` configuration option.
 
     Returns
     -------
@@ -689,6 +890,24 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
        2106-2113.
 
     """
+    resolved_engine = _resolve_phydiv_bp_engine(engine)
+    if isinstance(tree, BPTree):
+        if rooted is None:
+            rooted = _bp_is_rooted(tree)
+        _validate_phydiv_weight(weight)
+        return _phydiv_bp_run(
+            counts,
+            taxa,
+            tree,
+            validate,
+            resolved_engine,
+            rooted,
+            weight,
+            single_sample=True,
+        )
+    # helper -> phydiv -> the params_aliased wrapper -> the caller
+    _warn_engine_needs_bptree(engine, stacklevel=4)
+
     # whether tree is rooted should not affect whether metric can be calculated
     # ; it is common unrooted PD is calculated on a rooted tree
     counts_by_node, branch_lengths = _setup_pd(
@@ -700,12 +919,6 @@ def phydiv(counts, taxa, tree, rooted=None, weight=False, validate=True):
     if rooted is None:
         rooted = len(tree.root().children) == 2
 
-    # validate weight parameter
-    if (
-        not isinstance(weight, (bool, int, float))
-        or (w_ := float(weight)) < 0.0
-        or w_ > 1.0
-    ):
-        raise ValueError("Weight parameter must be Boolean or within [0, 1].")
+    _validate_phydiv_weight(weight)
 
     return _phydiv(counts_by_node, branch_lengths, rooted, weight)

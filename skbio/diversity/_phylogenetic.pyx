@@ -10,6 +10,7 @@ import numpy as np
 cimport numpy as np
 cimport cython
 from cython.parallel cimport prange
+from libc.math cimport pow
 
 # platform-specific
 INDEX_DTYPE = np.intp
@@ -270,3 +271,91 @@ def _faith_pd_bp(np.uint8_t[:, ::1] presence,
             if pref[s, hi[k]] - pref[s, lo[k]] > 0:
                 acc = acc + lengths[k]
         out[s] = acc
+
+
+@cython.boundscheck(False)
+@cython.wraparound(False)
+def _phydiv_bp(double[:, ::1] counts,
+               np.int32_t[::1] lo,
+               np.int32_t[::1] hi,
+               np.double_t[::1] lengths,
+               double[:, ::1] pref,
+               bint rooted,
+               bint weighted,
+               double theta,
+               np.double_t[::1] out):
+    """Batched generalized phylogenetic diversity over a BPTree's tip-ranges.
+
+    The ``phydiv`` counterpart of :func:`_faith_pd_bp`: an OpenMP-parallel
+    (``prange``) reduction that supersedes the sequential post-order
+    accumulation in :func:`_traverse_reduce`. For each sample it builds an
+    exclusive prefix of the sample's **abundance** in tip order, from which each
+    node's descendant-taxa count is the range sum
+    ``cbn = pref[hi[k]] - pref[lo[k]]`` and the sample total is ``pref[n_taxa]``
+    (the root spans ``[0, n_taxa)``). The four ``phydiv`` modes then reduce to a
+    per-node test/weight:
+
+    * unweighted, rooted:   add ``lengths[k]`` iff ``cbn > 0`` (== Faith's PD).
+    * unweighted, unrooted: add ``lengths[k]`` iff ``0 < cbn < total`` (drop the
+      branches that subtend every taxon).
+    * weighted, rooted:     add ``lengths[k] * (cbn/total) ** theta``.
+    * weighted, unrooted:   add ``lengths[k] * (2*min(f, 1-f)) ** theta`` where
+      ``f = cbn/total`` (the abundance "balance").
+
+    Parameters
+    ----------
+    counts : memoryview of double, shape (n_samples, n_taxa)
+        Abundances, already reordered into ascending tip order.
+    lo, hi : memoryview of int32, shape (n_nodes,)
+        Half-open descendant-taxa bounds of each node in that column space.
+    lengths : memoryview of double, shape (n_nodes,)
+        Branch length of each node.
+    pref : memoryview of double, shape (n_samples, n_taxa + 1)
+        Caller-allocated scratch for the per-sample prefix, indexed by the loop
+        variable (never by thread id, so no OpenMP runtime is required).
+    rooted : bool
+        Whether the root branches are retained.
+    weighted : bool
+        Whether branch lengths are weighted by relative abundance.
+    theta : double
+        Weighting exponent; only applied when ``theta < 1.0`` (fully-weighted
+        modes pass ``1.0`` and skip the ``pow``, matching the Python reference).
+    out : memoryview of double, shape (n_samples,)
+        Phylogenetic diversity per sample; written in place.
+    """
+    cdef:
+        Py_ssize_t s, j, k
+        Py_ssize_t n_samples = counts.shape[0]
+        Py_ssize_t n_taxa = counts.shape[1]
+        Py_ssize_t n_nodes = lengths.shape[0]
+        double acc, total, cbn, f, g
+
+    for s in prange(n_samples, nogil=True):
+        pref[s, 0] = 0.0
+        for j in range(n_taxa):
+            pref[s, j + 1] = pref[s, j] + counts[s, j]
+        total = pref[s, n_taxa]
+        if total == 0.0:
+            out[s] = 0.0
+        else:
+            acc = 0.0
+            for k in range(n_nodes):
+                cbn = pref[s, hi[k]] - pref[s, lo[k]]
+                if not weighted:
+                    if rooted:
+                        if cbn > 0.0:
+                            acc = acc + lengths[k]
+                    else:
+                        if cbn > 0.0 and cbn < total:
+                            acc = acc + lengths[k]
+                else:
+                    f = cbn / total
+                    if not rooted:
+                        g = 1.0 - f
+                        if g < f:
+                            f = g
+                        f = 2.0 * f
+                    if theta < 1.0:
+                        f = pow(f, theta)
+                    acc = acc + lengths[k] * f
+            out[s] = acc

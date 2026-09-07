@@ -23,8 +23,12 @@ from skbio.diversity.alpha._pd import (
     _faith_pd,
     _phydiv,
     _faith_pd_bp_run,
+    _phydiv_bp_run,
     _warn_engine_needs_bptree,
     _resolve_bp_engine,
+    _resolve_phydiv_bp_engine,
+    _bp_is_rooted,
+    _validate_phydiv_weight,
 )
 from skbio.diversity.beta._unifrac import (
     _setup_multiple_unweighted_unifrac,
@@ -154,6 +158,19 @@ def _faith_pd_bp_fast_path_eligible(tree, engine):
     return False
 
 
+def _phydiv_bp_fast_path_eligible(tree, engine):
+    """Whether the array-native ``BPTree`` fast path can serve ``phydiv``.
+
+    The ``phydiv`` twin of :func:`_faith_pd_bp_fast_path_eligible`: any
+    :class:`BPTree` is eligible; a non-BPTree with an explicitly requested
+    engine warns and falls back to the ``TreeNode`` path.
+    """
+    if isinstance(tree, BPTree):
+        return True
+    _warn_engine_needs_bptree(engine, stacklevel=4)
+    return False
+
+
 def alpha_diversity(
     metric: str | Callable,
     counts: TableLike,
@@ -182,15 +199,15 @@ def alpha_diversity(
         If True (default), validate the input data before applying the alpha diversity
         metric. See :mod:`skbio.diversity` for the details of validation.
     engine : str, optional
-        Compute engine for ``faith_pd`` when ``tree`` is a
-        :class:`~skbio.tree.BPTree`: ``"cython"`` (default), ``"numba"`` or
-        ``"gpu"`` (both require the optional ``numba`` package; ``"gpu"``
-        additionally needs a CUDA or ROCm device and falls back to ``"numba"``
-        when none is usable). The whole vector is computed in one call,
-        bypassing the per-sample loop. Ignored for other metrics and for
-        :class:`~skbio.TreeNode` input, where an explicitly requested
-        non-cython engine warns. Defaults to the global ``engine``
-        configuration option.
+        Compute engine for ``faith_pd`` and ``phydiv`` when ``tree`` is a
+        :class:`~skbio.tree.BPTree`: ``"cython"`` (default) or ``"numba"``
+        (which requires the optional ``numba`` package). ``faith_pd``
+        additionally accepts ``"gpu"`` (needs ``numba`` plus a CUDA or ROCm
+        device, and falls back to ``"numba"`` when none is usable). The whole
+        vector is computed in one call, bypassing the per-sample loop. Ignored
+        for other metrics and for :class:`~skbio.TreeNode` input, where an
+        explicitly requested non-cython engine warns. Defaults to the global
+        ``engine`` configuration option.
     kwargs : dict, optional
         Metric-specific parameters. Refer to the documentation of the chosen metric.
         A special parameter is ``taxa``, needed by some phylogenetic metrics. If not
@@ -234,6 +251,33 @@ def alpha_diversity(
                 # Python loop.
                 result = _faith_pd_bp_run(
                     counts, taxa, tree, validate, resolved_engine, False
+                )
+                return pd.Series(result, index=ids)
+        else:
+            resolved_engine = _resolve_phydiv_bp_engine(engine)
+            if _phydiv_bp_fast_path_eligible(tree, engine):
+                # Same one-shot BP fast path as faith_pd; must precede the
+                # TreeNode-only _setup_pd / tree._is_rooted() below, which a
+                # BPTree cannot serve. Match the TreeNode path's rooted
+                # resolution exactly: autodetect only when the caller omits
+                # rooted (mirroring kwargs.setdefault); an explicit value is
+                # passed to _phydiv's ``rooted is False`` test, so anything but
+                # False (including None) is rooted.
+                if "rooted" in kwargs:
+                    rooted = kwargs.pop("rooted") is not False
+                else:
+                    rooted = _bp_is_rooted(tree)
+                weight = kwargs.pop("weight", False)
+                _validate_phydiv_weight(weight)
+                result = _phydiv_bp_run(
+                    counts,
+                    taxa,
+                    tree,
+                    validate,
+                    resolved_engine,
+                    rooted,
+                    weight,
+                    False,
                 )
                 return pd.Series(result, index=ids)
         counts, lengths = _setup_pd(
