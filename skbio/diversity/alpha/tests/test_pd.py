@@ -7,6 +7,7 @@
 # ----------------------------------------------------------------------------
 
 from unittest import TestCase, main
+import warnings
 from io import StringIO
 import os
 
@@ -369,10 +370,33 @@ class FaithPDBPTreeEngineTests(TestCase):
             alpha_diversity("faith_pd", self.b1, taxa=self.oids1, tree=self.t1), got
         )
 
+    def test_global_engine_default_does_not_warn_on_treenode(self):
+        # a global set_config("engine", ...) must degrade silently: only an
+        # explicit per-call engine= that cannot be served is worth warning
+        # about, else every pre-existing TreeNode call in a script warns.
+        from skbio import get_config, set_config
+
+        prev = get_config("engine")
+        set_config("engine", "numba")
+        try:
+            with warnings.catch_warnings(record=True) as caught:
+                warnings.simplefilter("always")
+                got = faith_pd(self.b1[0], self.oids1, self.t1)
+                alpha_diversity("faith_pd", self.b1, taxa=self.oids1,
+                                tree=self.t1)
+            self.assertEqual([str(w.message) for w in caught], [])
+            # ... while an explicit request still does warn
+            with self.assertWarnsRegex(UserWarning, "BPTree"):
+                faith_pd(self.b1[0], self.oids1, self.t1, engine="numba")
+        finally:
+            set_config("engine", prev)
+        self.assertAlmostEqual(got, faith_pd(self.b1[0], self.oids1, self.t1),
+                               places=10)
+
     def test_unsupported_engine_rejected(self):
         bp = BPTree.from_treenode(self.t1)
         with self.assertRaises(ValueError):
-            faith_pd(self.b1[0], self.oids1, bp, engine="gpu")
+            faith_pd(self.b1[0], self.oids1, bp, engine="nonesuch")
 
     def test_error_parity(self):
         for eng in _BP_ENGINES:

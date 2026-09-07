@@ -117,7 +117,14 @@ def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
     # Map each taxon to its tip rank, then compact the (full) node tip-ranges
     # onto the taxa columns via a single sort + two searchsorted lookups.
     rank = {name: r for r, name in enumerate(tip_names)}
-    tip_rank = np.fromiter((rank[t] for t in taxa), np.int32, len(taxa))
+    try:
+        tip_rank = np.fromiter((rank[t] for t in taxa), np.int32, len(taxa))
+    except KeyError as e:
+        # only reachable with validate=False; report it the way the validated
+        # path does rather than letting a bare KeyError escape the generator
+        raise MissingNodeError(
+            f"taxon {e.args[0]!r} is not present as a tip name in the tree."
+        ) from None
     perm = np.argsort(tip_rank, kind="stable").astype(np.int32)
     srt = tip_rank[perm]
     lo = np.searchsorted(srt, tip_first).astype(np.int32)
@@ -125,6 +132,53 @@ def _setup_pd_bp(counts, taxa, tree, validate, single_sample=True):
 
     lengths[np.isnan(lengths)] = 0.0
     return perm, lo, hi, lengths
+
+
+def _warn_engine_needs_bptree(engine, stacklevel):
+    """Warn that an explicitly requested engine needs a ``BPTree`` to be served.
+
+    Gated on the caller's **raw** ``engine`` argument rather than the resolved
+    one, mirroring
+    :func:`~skbio.diversity._driver._numba_unifrac_fast_path_eligible`: an
+    explicit request that cannot be honored stays visible, while a global
+    ``set_config("engine", ...)`` default degrades silently instead of warning
+    on every existing ``TreeNode`` call.
+    """
+    if engine is not None and engine != "cython":
+        warnings.warn(
+            f"engine={engine!r} is only available for BPTree input; the "
+            "TreeNode path uses the cython engine.",
+            stacklevel=stacklevel,
+        )
+
+
+def _presence_in_tip_order(counts, perm):
+    """Reorder ``counts`` into tip order as a C-contiguous presence matrix.
+
+    The comparison comes first so the reorder moves one byte per element rather
+    than the width of the count dtype.
+
+    ``np.take(..., axis=1)`` rather than ``arr[:, perm]``: on a C-contiguous
+    input the fancy-index form returns an **F-contiguous** result, so feeding it
+    to the ``uint8[:, ::1]`` kernels then costs a transposing copy. ``take``
+    writes C-contiguous directly, which at 2048 samples x 50k taxa is 75 ms
+    against 1301 ms for ``ascontiguousarray(arr[:, perm])``.
+
+    Parameters
+    ----------
+    counts : array_like of shape (n_samples, n_taxa) or (n_taxa,)
+        Counts/abundances, in ``taxa`` order.
+    perm : ndarray of int32 of shape (n_taxa,)
+        Reorders the ``taxa`` columns into ascending tip order.
+
+    Returns
+    -------
+    ndarray of uint8 of shape (n_samples, n_taxa)
+        C-contiguous present-taxon indicator in tip order.
+
+    """
+    # bool and uint8 are both one byte, so the view is a free reinterpretation
+    return np.take(np.greater(np.atleast_2d(counts), 0), perm, axis=1).view(np.uint8)
 
 
 def _faith_pd_bp_cython(presence, lo, hi, lengths, max_bytes=64 * 1024 * 1024):
@@ -188,10 +242,7 @@ def _faith_pd_bp_run(counts, taxa, tree, validate, engine, single_sample):
     perm, lo, hi, lengths = _setup_pd_bp(
         counts, taxa, tree, validate, single_sample=single_sample
     )
-    # Compare before gathering so the reorder moves one byte per element.
-    presence = np.ascontiguousarray(
-        np.greater(np.atleast_2d(counts), 0)[:, perm], dtype=np.uint8
-    )
+    presence = _presence_in_tip_order(counts, perm)
     if engine == "numba":
         out = _faith_pd_bp_nb(presence, lo, hi, lengths)
     else:
@@ -356,15 +407,11 @@ def faith_pd(counts, taxa, tree, validate=True, engine=None):
     6.95
 
     """
-    engine = _resolve_engine(engine, ("cython", "numba"))
+    resolved_engine = _resolve_engine(engine, ("cython", "numba"))
     if isinstance(tree, BPTree):
-        return _faith_pd_bp_run(counts, taxa, tree, validate, engine, True)
-    if engine != "cython":
-        warnings.warn(
-            f"engine={engine!r} is only available for BPTree input; the "
-            "TreeNode path uses the cython engine.",
-            stacklevel=2,
-        )
+        return _faith_pd_bp_run(counts, taxa, tree, validate, resolved_engine, True)
+    # helper -> faith_pd -> the params_aliased wrapper -> the caller
+    _warn_engine_needs_bptree(engine, stacklevel=4)
     counts_by_node, branch_lengths = _setup_pd(
         counts, taxa, tree, validate, rooted=True, single_sample=True
     )

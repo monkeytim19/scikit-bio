@@ -24,6 +24,7 @@ from skbio.diversity.alpha._pd import (
     _faith_pd,
     _phydiv,
     _faith_pd_bp_run,
+    _warn_engine_needs_bptree,
 )
 from skbio.diversity.beta._unifrac import (
     _setup_multiple_unweighted_unifrac,
@@ -138,23 +139,18 @@ def get_beta_diversity_metrics() -> list[str]:
     return sorted(_pdist_metrics.union(["unweighted_unifrac", "weighted_unifrac"]))
 
 
-def _faith_pd_bp_fast_path_eligible(tree, resolved_engine):
+def _faith_pd_bp_fast_path_eligible(tree, engine):
     """Whether the array-native ``BPTree`` fast path can serve ``faith_pd``.
 
     Mirrors :func:`_numba_unifrac_fast_path_eligible`: any :class:`BPTree` is
-    eligible (for both the cython and numba engines, which compute the whole
-    vector directly and bypass the per-sample loop). A non-cython engine
-    explicitly resolved on a :class:`~skbio.TreeNode` warns and falls back, so
-    the request stays visible.
+    eligible (every engine computes the whole vector directly and bypasses the
+    per-sample loop). ``engine`` is the caller's **raw** argument, not the
+    resolved one, so an explicit request that cannot be served warns while a
+    global ``set_config("engine", ...)`` default degrades silently.
     """
     if isinstance(tree, BPTree):
         return True
-    if resolved_engine != "cython":
-        warnings.warn(
-            f"engine={resolved_engine!r} is only available for BPTree input; "
-            "the TreeNode path uses the cython engine.",
-            stacklevel=3,
-        )
+    _warn_engine_needs_bptree(engine, stacklevel=4)
     return False
 
 
@@ -229,7 +225,7 @@ def alpha_diversity(
         is_faith_pd = metric == "faith_pd"
         if is_faith_pd:
             resolved_engine = _resolve_engine(engine, ("cython", "numba"))
-            if _faith_pd_bp_fast_path_eligible(tree, resolved_engine):
+            if _faith_pd_bp_fast_path_eligible(tree, engine):
                 # Compute the whole vector in one engine call: no
                 # (n_samples, n_nodes) counts_by_node matrix and no per-sample
                 # Python loop.
