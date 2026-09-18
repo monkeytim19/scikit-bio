@@ -216,6 +216,24 @@ class NewickTests(TestCase):
         with self.assertRaises(ValueError):
             parse_newick("((a,b)c,d)r[oops;")
 
+    def test_parse_newick_quoted_brace_is_literal(self):
+        # A '{' inside a single-quoted label is literal label content, not an
+        # edge annotation, so it must not be split off or parsed as an int.
+        obs = parse_newick("('a{3}',c)r;")
+        names = {obs.name(i) for i, v in enumerate(obs.data) if v}
+        self.assertIn("a{3}", names)
+        self.assertTrue(all(obs.edge(i) == 0 for i, v in enumerate(obs.data) if v))
+        # A non-integer inside a quoted brace must not raise (it is not an edge).
+        obs = parse_newick("('a{b}',c)r;")
+        self.assertIn("a{b}", {obs.name(i) for i, v in enumerate(obs.data) if v})
+
+    def test_parse_newick_unquoted_edge_number(self):
+        # An unquoted trailing '{N}' is still parsed as the edge number.
+        obs = parse_newick("(a{3},b)r;")
+        edges = {obs.name(i): obs.edge(i) for i, v in enumerate(obs.data) if v}
+        self.assertEqual(edges["a"], 3)
+        self.assertEqual(edges["b"], 0)
+
 
 if __name__ == '__main__':
     main()

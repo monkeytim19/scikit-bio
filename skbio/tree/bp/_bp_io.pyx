@@ -80,6 +80,26 @@ cdef inline Py_ssize_t _find_length_colon(unicode token):
     return -1
 
 
+cdef inline Py_ssize_t _find_edge_curly(unicode token):
+    """Index of the edge-number ``{`` (the first ``{`` outside single quotes).
+
+    A ``{`` inside a single-quoted label is literal label content (like a colon
+    handled by :func:`_find_length_colon`), not an edge annotation.
+    """
+    cdef:
+        Py_ssize_t i, n = len(token)
+        bint in_quote = False
+        Py_UCS4 c
+
+    for i in range(n):
+        c = token[i]
+        if c == u"'":
+            in_quote = not in_quote
+        elif c == u'{' and not in_quote:
+            return i
+    return -1
+
+
 cdef unicode _strip_comments(unicode data):
     """Remove Newick ``[comment]`` regions.
 
@@ -151,14 +171,17 @@ cdef void _set_node_metadata(cnp.uint32_t ptr, unicode token,
             token_parsed = token[split_idx + 1:]
             length = length_from_edge(token_parsed)
             edge = number_from_edge(token_parsed)
-        elif u'{' in token:
-            # an edge number with no branch length, e.g. "{3}" or "name{3}"
-            curly = token.find(u'{')
-            if curly > 0:
-                name = _unquote_name(token[:curly], convert_underscores)
-            edge = number_from_edge(token[curly:])
         else:
-            name = _unquote_name(token, convert_underscores)
+            curly = _find_edge_curly(token)
+            if curly != -1:
+                # an edge number with no branch length, e.g. "{3}" or "name{3}".
+                # A ``{`` inside a quoted label (e.g. "'a{3}'") is literal and is
+                # not matched here, so it stays part of the name.
+                if curly > 0:
+                    name = _unquote_name(token[:curly], convert_underscores)
+                edge = number_from_edge(token[curly:])
+            else:
+                name = _unquote_name(token, convert_underscores)
 
     # Whitespace around a branch-length ``:`` (e.g. ") :0.1") can leave an
     # empty name once unquoted; an unnamed node is None, not "".
