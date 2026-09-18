@@ -113,18 +113,33 @@ class TestJplaceReader(unittest.TestCase):
         with self.assertRaises(JplaceFormatError):
             self._read_bp(json.dumps(data))
 
-    def test_missing_n_raises(self):
+    def test_nm_only_document_reads_tree(self):
+        # The jplace spec allows a pquery to carry ``nm`` (name, multiplicity)
+        # instead of ``n``. The reference tree does not depend on the placement
+        # encoding, so such a document must still read (placements are dropped).
         data = json.loads(self.jplacedata)
         for placement in data["placements"]:
-            placement.pop("n", None)
-        with self.assertRaises(JplaceFormatError):
-            self._read_bp(json.dumps(data))
+            names = placement.pop("n", [])
+            placement["nm"] = [[name, 1] for name in names]
+        bp = self._read_bp(json.dumps(data))
+        self.assertEqual(TreeNode.from_bptree(bp).compare_rfd(self.tree), 0)
 
-    def test_fields_without_edge_num_raises(self):
+    def test_fields_without_edge_num_still_reads(self):
+        # ``fields`` only matters for mapping placements, which the reader drops,
+        # so a document whose fields omit ``edge_num`` still yields the tree.
         data = json.loads(self.jplacedata)
         data["fields"] = [f for f in data["fields"] if f != "edge_num"]
-        with self.assertRaises(JplaceFormatError):
-            self._read_bp(json.dumps(data))
+        bp = self._read_bp(json.dumps(data))
+        self.assertEqual(TreeNode.from_bptree(bp).compare_rfd(self.tree), 0)
+
+    def test_null_member_raises(self):
+        # A present-but-null structural member must surface as a format error,
+        # not leak a raw TypeError from the tree read.
+        for key in ("tree", "placements", "fields"):
+            data = json.loads(self.jplacedata)
+            data[key] = None
+            with self.assertRaises(JplaceFormatError):
+                self._read_bp(json.dumps(data))
 
 
 class TestJplaceWriter(unittest.TestCase):
@@ -348,6 +363,16 @@ class TestParseJplace(unittest.TestCase):
         del data["version"]
         with self.assertRaises(ValueError):
             parse_jplace(json.dumps(data))
+
+    def test_null_member_raises_value_error(self):
+        # A present-but-null member must raise ValueError, not a raw TypeError
+        # (list(None), len(None), str.strip on None) that bypasses the registry's
+        # JplaceFormatError wrapping.
+        for key in ("tree", "placements", "fields"):
+            data = json.loads(self.jplacedata)
+            data[key] = None
+            with self.assertRaises(ValueError):
+                parse_jplace(json.dumps(data))
 
 
 class TestWriteJplaceBackend(unittest.TestCase):

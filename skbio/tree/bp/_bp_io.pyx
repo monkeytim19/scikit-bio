@@ -520,6 +520,16 @@ def parse_jplace(object data):
                 "jplace document is missing the required '%s' member" % key
             )
 
+    # A present-but-mistyped member (e.g. ``null``) would otherwise raise a raw
+    # TypeError (str.strip on None, len(None), list(None)); normalize those to
+    # the ValueError the caller wraps.
+    if not isinstance(as_json['tree'], str):
+        raise ValueError("jplace 'tree' member must be a Newick string")
+    if not isinstance(as_json['placements'], list):
+        raise ValueError("jplace 'placements' member must be a list")
+    if not isinstance(as_json['fields'], list):
+        raise ValueError("jplace 'fields' member must be a list")
+
     newick = as_json['tree']
     placement_data = as_json['placements']
     fields = list(as_json['fields'])

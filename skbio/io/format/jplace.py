@@ -112,17 +112,45 @@ def _jplace_sniffer(fh):
 
 
 def _read_tree(fh):
-    """Parse a jplace document and return its reference tree (drop placements)."""
-    from skbio.tree.bp._bp_io import parse_jplace
+    """Parse a jplace document and return its reference tree (drop placements).
 
-    # The compiled parser scans the whole document at once; materialize the
-    # handle first. It raises ValueError/KeyError on malformed input; re-raise
-    # as the format's error type per the registry convention.
+    The reader only needs the reference tree, so it validates the top-level
+    JSON and parses ``tree`` directly rather than routing through
+    ``parse_jplace``. This neither rejects otherwise valid placement encodings
+    (e.g. a document whose pqueries use ``nm`` instead of ``n``) nor builds --
+    and immediately discards -- a placements table that scales with the file.
+    """
+    from skbio.tree.bp._bp_io import parse_newick
+
+    # ``json.JSONDecodeError`` is a ``ValueError`` subclass, so malformed JSON is
+    # wrapped as ``JplaceFormatError`` too, per the registry convention.
     try:
-        _, tree = parse_jplace(fh.read())
+        doc = json.loads(fh.read())
+        if not isinstance(doc, dict):
+            raise ValueError("jplace document must be a JSON object")
+        # Require the structural members (matching the sniffer) and check the
+        # types the tree read relies on, so a present-but-``null`` member raises
+        # a JplaceFormatError rather than leaking a TypeError. The placement
+        # *contents* are intentionally not inspected: the reference tree does not
+        # depend on how pqueries are encoded (``n`` vs ``nm``) or on which
+        # ``fields`` are declared, so both are accepted here.
+        for key in ("tree", "placements", "fields", "version"):
+            if key not in doc:
+                raise ValueError(
+                    "jplace document is missing the required '%s' member" % key
+                )
+        newick = doc["tree"]
+        if not isinstance(newick, str):
+            raise ValueError("jplace 'tree' member must be a Newick string")
+        if not isinstance(doc["placements"], list):
+            raise ValueError("jplace 'placements' member must be a list")
+        if not isinstance(doc["fields"], list):
+            raise ValueError("jplace 'fields' member must be a list")
+        # jplace taxa are typically accessions where '_' is significant, not a
+        # stand-in for a space, so underscores are preserved.
+        return parse_newick(newick, convert_underscores=False)
     except (ValueError, KeyError) as e:
         raise JplaceFormatError("Could not parse file as jplace: %s" % e) from e
-    return tree
 
 
 @jplace.reader(BPTree)
