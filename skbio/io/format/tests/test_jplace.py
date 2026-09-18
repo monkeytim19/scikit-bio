@@ -186,19 +186,13 @@ class TestJplaceWriter(unittest.TestCase):
         self.assertTrue(doc["tree"].rstrip().endswith(";"))
         self.assertEqual(doc["placements"], [])
 
-    def test_write_edgeless_tree_is_degenerate_but_readable(self):
-        # A tree with no edge numbers writes {0} on every edge (no unique
-        # numbers); topology still round-trips.
+    def test_write_edgeless_tree_rejected(self):
+        # A tree with no edge numbers has 0 on every edge; writing it would emit
+        # duplicate {0} IDs, which cannot identify edges in jplace. The writer
+        # rejects it rather than producing an ambiguous document.
         bp = skbio.io.read(["((a,b)c,d)r;"], into=BPTree, format="newick")
-        buf = io.StringIO()
-        bp.write(buf, format="jplace")
-        doc = json.loads(buf.getvalue())
-        self.assertNotIn("{1}", doc["tree"])
-        back = skbio.io.read([buf.getvalue()], into=BPTree, format="jplace")
-        self.assertEqual(
-            TreeNode.from_bptree(bp).compare_rfd(TreeNode.from_bptree(back)),
-            0,
-        )
+        with self.assertRaises(JplaceFormatError):
+            bp.write(io.StringIO(), format="jplace")
 
 
 class TestJplaceReferenceTreeGrammar(unittest.TestCase):
@@ -401,6 +395,19 @@ class TestWriteJplaceBackend(unittest.TestCase):
         # The written document must stay readable by parse_jplace.
         with self.assertRaises(ValueError):
             write_jplace(self.bp, io.StringIO(), fields=["likelihood"])
+
+    def test_non_unique_edges_raise(self):
+        # A tree with no real edge numbers has 0 on every edge; emitting it would
+        # write duplicate {0} IDs, which cannot identify edges in jplace.
+        edgeless = skbio.io.read(["((a,b)c,d)r;"], into=BPTree, format="newick")
+        with self.assertRaises(ValueError):
+            write_jplace(edgeless, io.StringIO())
+
+    def test_unique_edges_write(self):
+        # The fixture tree carries unique edge numbers, so it writes fine.
+        buf = io.StringIO()
+        write_jplace(self.bp, buf)
+        self.assertRegex(json.loads(buf.getvalue())["tree"], r"\{\d+\}")
 
 
 if __name__ == "__main__":

@@ -162,4 +162,10 @@ def _jplace_to_bp(fh, cls=None):
 def _bp_to_jplace(obj, fh):
     from skbio.tree.bp._bp_io import write_jplace
 
-    write_jplace(obj, fh)
+    # write_jplace raises ValueError/TypeError for an unwritable tree (e.g. one
+    # whose edge numbers are not unique) or bad options; surface them as the
+    # format's error type per the registry convention, mirroring the reader.
+    try:
+        write_jplace(obj, fh)
+    except (ValueError, TypeError) as e:
+        raise JplaceFormatError("Could not write BPTree as jplace: %s" % e) from e

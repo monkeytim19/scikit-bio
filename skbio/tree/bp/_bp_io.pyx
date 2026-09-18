@@ -616,8 +616,9 @@ def write_jplace(BPTree tree, object output, object fields=None,
     ----------
     tree : BPTree
         The reference tree, serialized as Newick with ``{}`` edge numbers via
-        :func:`write_newick`. Existing edge numbers are written as-is; a tree
-        without edge numbers emits ``{0}`` on every edge.
+        :func:`write_newick`. Its edge numbers are written as-is and must be
+        unique, since jplace edge numbers identify edges. A tree read from plain
+        Newick has ``0`` on every edge and is rejected (see ``Raises``).
     output : file-like object
         An open, writable handle that the JSON document is written to.
     fields : list of str, optional
@@ -633,12 +634,15 @@ def write_jplace(BPTree tree, object output, object fields=None,
         If ``fields`` is a string rather than a sequence of field names.
     ValueError
         If ``fields`` is given but does not include ``edge_num``, which the
-        reader requires to map placements onto the reference tree.
+        reader requires to map placements onto the reference tree; or if the
+        tree's edge numbers are not unique (e.g. a tree read from plain Newick,
+        which has ``0`` on every edge), since duplicate edge numbers cannot
+        unambiguously identify edges in jplace.
 
     """
     cdef:
         unicode tree_str
-        list field_names
+        list field_names, edge_vals
         object buf, document
 
     from io import StringIO
@@ -654,6 +658,19 @@ def write_jplace(BPTree tree, object output, object fields=None,
         field_names = list(fields)
         if "edge_num" not in field_names:
             raise ValueError("fields must include 'edge_num'")
+
+    # jplace edge numbers identify edges, so they must be unique. The root has no
+    # incoming edge and is not numbered in jplace; in a BPTree it defaults to edge
+    # 0 and may coincide with a real edge 0, so it is excluded here (the root is
+    # the first node in the parentheses array). A tree with no real edge numbers
+    # has 0 on every edge and would produce ambiguous, invalid jplace.
+    edge_vals = [tree.edge(i) for i, v in enumerate(tree.data) if v][1:]
+    if len(set(edge_vals)) != len(edge_vals):
+        raise ValueError(
+            "cannot write jplace: the tree's edge numbers are not unique. jplace "
+            "edge numbers must uniquely identify edges; a tree read from plain "
+            "Newick has 0 on every edge and is not a valid jplace reference tree."
+        )
 
     buf = StringIO()
     write_newick(tree, buf, True)
