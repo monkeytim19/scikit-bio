@@ -19,10 +19,14 @@ import numpy as np
 import array_api_compat as aac
 
 from skbio._base import SkbioObject
+from skbio._config import _resolve_engine
 from skbio.io.descriptors import Read, Write
+from skbio.stats.distance import DistanceMatrix
+from skbio.tree._exception import DuplicateNodeError, MissingNodeError
 
-from . import _bp_cy
+from . import _bp_cy, _bp_numba
 from ._bp_cy import _BPKernel
+from ._bp_numba import NUMBA_AVAILABLE
 
 
 # Navigation methods implemented by the compiled kernel. ``BPTree`` binds each
@@ -59,6 +63,12 @@ _KERNEL_METHODS = (
     "height",
 )
 _get_kernel_methods = attrgetter(*_KERNEL_METHODS)
+
+# Compute engines of the batch operations, and what ``engine="fast"`` resolves
+# to: the Numba kernels are parallel (``prange``) wherever Numba runs, whereas
+# the Cython kernels are parallel only where scikit-bio is built with OpenMP.
+_ENGINES = ("cython", "numba")
+_FAST_ENGINE = "numba" if NUMBA_AVAILABLE else "cython"
 
 
 def _rmm_geometry(n):
@@ -1140,6 +1150,287 @@ class BPTree(SkbioObject):
             The number of edges between node i and its deepest node
         """
         return self._kernel.height(i)
+
+    # ------------------------------------------------------------------
+    # Batch operations (computed by the selected engine)
+    # ------------------------------------------------------------------
+
+    def _run(self, kernel, engine, *args):
+        """Run a batch kernel of the selected compute engine on this tree."""
+        engine = _resolve_engine(engine, _ENGINES, fast=_FAST_ENGINE)
+        if engine == "numba":
+            return getattr(_bp_numba, kernel)(_bp_numba.bp_arrays(self), *args)
+        return getattr(_bp_cy, kernel)(self._kernel, *args)
+
+    def _positions(self, *arrays):
+        """Validate node positions: broadcast, flatten, check the range."""
+        arrays = np.broadcast_arrays(*(np.asarray(a) for a in arrays))
+        shape = arrays[0].shape
+        out = []
+        for arr in arrays:
+            # an empty list is float64 but holds no positions to check
+            if arr.size and arr.dtype.kind not in "iu":
+                raise TypeError("Node positions must be integers, not %s." % arr.dtype)
+            arr = np.ascontiguousarray(arr.ravel(), dtype=np.intp)
+            if arr.size and (arr.min() < 0 or arr.max() >= self._size):
+                raise IndexError("Node positions must be in [0, %d)." % self._size)
+            out.append(arr)
+        return shape, out
+
+    def close_batch(self, i, engine=None):
+        """Matching closing parenthesis of each position in a batch.
+
+        The batch counterpart of :meth:`close`: one independent query per
+        element of ``i``, computed by the selected engine.
+
+        Parameters
+        ----------
+        i : array_like of int
+            Positions to evaluate.
+        engine : {'cython', 'numba', 'fast'}, optional
+            The :ref:`compute engine <compute_engines>`. Defaults to the global
+            ``compute_engine`` option.
+
+        Returns
+        -------
+        numpy.ndarray of intp
+            ``close(i)`` for each position, in the shape of ``i``.
+
+        See Also
+        --------
+        close
+
+        """
+        shape, (i,) = self._positions(i)
+        return self._run("close_batch", engine, i).reshape(shape)
+
+    def parent_batch(self, i, engine=None):
+        """Parent of each node in a batch.
+
+        The batch counterpart of :meth:`parent`: one independent query per
+        element of ``i``, computed by the selected engine.
+
+        Parameters
+        ----------
+        i : array_like of int
+            Node positions to evaluate.
+        engine : {'cython', 'numba', 'fast'}, optional
+            The :ref:`compute engine <compute_engines>`. Defaults to the global
+            ``compute_engine`` option.
+
+        Returns
+        -------
+        numpy.ndarray of intp
+            ``parent(i)`` for each position (-1 for the root), in the shape of
+            ``i``.
+
+        See Also
+        --------
+        parent
+
+        """
+        shape, (i,) = self._positions(i)
+        return self._run("parent_batch", engine, i).reshape(shape)
+
+    def lca_batch(self, i, j, engine=None):
+        """Lowest common ancestor of each pair of nodes in a batch.
+
+        The batch counterpart of :meth:`lca`: one independent query per pair
+        ``(i[k], j[k])``, computed by the selected engine. This is not the
+        lowest common ancestor of a set of nodes (as
+        :meth:`skbio.tree.TreeNode.lca` computes).
+
+        Parameters
+        ----------
+        i, j : array_like of int
+            Node positions of each pair, broadcast against each other. The
+            order within a pair does not matter.
+        engine : {'cython', 'numba', 'fast'}, optional
+            The :ref:`compute engine <compute_engines>`. Defaults to the global
+            ``compute_engine`` option.
+
+        Returns
+        -------
+        numpy.ndarray of intp
+            The position of the lowest common ancestor of each pair, in the
+            broadcast shape of ``i`` and ``j``.
+
+        See Also
+        --------
+        lca
+
+        Notes
+        -----
+        Unlike :meth:`lca`, which requires ``i <= j``, each pair is ordered
+        before the query.
+
+        """
+        shape, (i, j) = self._positions(i, j)
+        return self._run("lca_batch", engine, i, j).reshape(shape)
+
+    def level_ancestor_batch(self, i, d, engine=None):
+        """Ancestor a given number of levels above each node in a batch.
+
+        The batch counterpart of :meth:`level_ancestor`: one independent query
+        per element of ``i`` (and ``d``), computed by the selected engine.
+
+        Parameters
+        ----------
+        i : array_like of int
+            Node positions to evaluate.
+        d : int or array_like of int
+            Number of levels to ascend, broadcast against ``i``.
+        engine : {'cython', 'numba', 'fast'}, optional
+            The :ref:`compute engine <compute_engines>`. Defaults to the global
+            ``compute_engine`` option.
+
+        Returns
+        -------
+        numpy.ndarray of intp
+            ``level_ancestor(i, d)`` for each pair, in the broadcast shape of
+            ``i`` and ``d``.
+
+        See Also
+        --------
+        level_ancestor
+
+        """
+        i, d = np.broadcast_arrays(np.asarray(i), np.asarray(d))
+        if d.size and d.dtype.kind not in "iu":
+            raise TypeError("Levels must be integers, not %s." % d.dtype)
+        shape, (i,) = self._positions(i)
+        d = np.ascontiguousarray(d.ravel(), dtype=np.intp)
+        return self._run("level_ancestor_batch", engine, i, d).reshape(shape)
+
+    def cophenet(self, endpoints=None, use_length=True, engine=None):
+        r"""Return a distance matrix between each pair of tips in the tree.
+
+        The balanced-parentheses counterpart of
+        :meth:`skbio.tree.TreeNode.cophenet`.
+
+        Parameters
+        ----------
+        endpoints : iterable of str, optional
+            Names of the tips to be included in the calculation. The returned
+            distance matrix will use this order. If not specified, all named
+            tips will be included, in the order they appear in the tree.
+        use_length : bool, optional
+            Whether to return the sum of branch lengths (True, default) or the
+            number of branches (False) connecting each pair of tips.
+        engine : {'cython', 'numba', 'fast'}, optional
+            The :ref:`compute engine <compute_engines>`. Defaults to the global
+            ``compute_engine`` option.
+
+        Returns
+        -------
+        DistanceMatrix
+            The cophenetic distance matrix.
+
+        Raises
+        ------
+        MissingNodeError
+            If any of the specified ``endpoints`` are not found in the tree.
+        DuplicateNodeError
+            If the specified ``endpoints`` have duplicates, or if the tree has
+            duplicate tip names when ``endpoints`` is not specified.
+        ValueError
+            If any of the specified ``endpoints`` are not tips.
+
+        See Also
+        --------
+        lca_batch
+        skbio.tree.TreeNode.cophenet
+
+        Notes
+        -----
+        The distance between tips :math:`a` and :math:`b` with lowest common
+        ancestor :math:`c` is :math:`d(a) + d(b) - 2d(c)`, where :math:`d` is
+        the sum of branch lengths (or the number of branches) from the root.
+        The tip pairs are independent and are computed in parallel by the
+        selected engine. Missing branch lengths are 0.
+
+        Examples
+        --------
+        >>> from skbio.tree import BPTree
+        >>> tree = BPTree.read(["((a:1,b:2)c:3,(d:4,e:5)f:6)root;"])
+        >>> print(tree.cophenet())
+        4x4 distance matrix
+        IDs:
+        'a', 'b', 'd', 'e'
+        Data:
+        [[ 0.  3. 14. 15.]
+         [ 3.  0. 15. 16.]
+         [14. 15.  0.  9.]
+         [15. 16.  9.  0.]]
+
+        """
+        B = self._data
+        is_tip = np.zeros(self._size, dtype=bool)
+        is_tip[:-1] = (B[:-1] == 1) & (B[1:] == 0)
+        tips = np.flatnonzero(is_tip)
+
+        if not endpoints:
+            names = self._names[tips]
+            named = np.array([name is not None for name in names], dtype=bool)
+            tips = tips[named]
+            taxa = names[named].tolist()
+            if len(set(taxa)) < len(taxa):
+                raise DuplicateNodeError("Tree contains duplicate tip names.")
+        else:
+            # name lookup as TreeNode.find: tips first, then the first internal
+            # node (in preorder) with the name
+            lookup = {}
+            for pos in tips.tolist():
+                lookup.setdefault(self._names[pos], pos)
+            for pos in np.flatnonzero(B & ~is_tip).tolist():
+                lookup.setdefault(self._names[pos], pos)
+            taxa, positions = [], []
+            for name in endpoints:
+                if name is None:
+                    raise MissingNodeError("Cannot find a node without a name.")
+                if name in taxa:
+                    raise DuplicateNodeError(f"Duplicate tip name '{name}' found.")
+                pos = lookup.get(name)
+                if pos is None:
+                    raise MissingNodeError(f"Node '{name}' is not found in the tree.")
+                if not is_tip[pos]:
+                    raise ValueError(f"Node with name '{name}' is not a tip.")
+                taxa.append(name)
+                positions.append(pos)
+            tips = np.array(positions, dtype=np.intp)
+
+        tips = np.ascontiguousarray(tips, dtype=np.intp)
+        if tips.size < 2:
+            # no pairs; an empty condensed vector would expand to 1 x 1
+            return DistanceMatrix(
+                np.zeros((tips.size, tips.size)), taxa, validate=False
+            )
+        engine = _resolve_engine(engine, _ENGINES, fast=_FAST_ENGINE)
+
+        # the kernel takes the tips in tree order, and the output row (slot) of
+        # each: its place in the requested order
+        order = np.argsort(tips, kind="stable")
+        sorted_tips = tips[order]
+        slot = np.ascontiguousarray(order, dtype=np.intp)
+
+        # per node: its parent, and the end of its tips among the sorted tips
+        # (the number of them before its closing parenthesis)
+        opens = np.flatnonzero(B)
+        parent = np.full(self._size, -1, dtype=np.intp)
+        parent[opens] = self._run("parent_batch", engine, opens)
+        selected = np.zeros(self._size, dtype=np.intp)
+        selected[sorted_tips] = 1
+        end = np.zeros(self._size, dtype=np.intp)
+        end[opens] = np.cumsum(selected)[self._run("close_batch", engine, opens)]
+        del selected
+
+        if use_length:
+            dist = self._run("root_distances", engine, self._lengths)
+        else:
+            dist = self._e_index.astype(np.float64)
+        kernels = _bp_numba if engine == "numba" else _bp_cy
+        matrix = kernels.tip_distances(sorted_tips, slot, parent, end, dist)
+        return DistanceMatrix(matrix, taxa, validate=False)
 
     # ------------------------------------------------------------------
     # Whole-tree operations

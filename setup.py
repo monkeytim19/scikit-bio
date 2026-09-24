@@ -199,6 +199,8 @@ extensions += [
         "skbio.tree.bp._bp_cy",
         ["skbio/tree/bp/_bp_cy.pyx"],
         include_dirs=_bp_includes,
+        extra_compile_args=extra_compile_args,
+        extra_link_args=extra_link_args,
     ),
     Extension(
         "skbio.tree.bp._bp_io",

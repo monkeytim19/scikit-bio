@@ -32,6 +32,7 @@ from libc.math cimport pow
 import numpy as np
 cimport numpy as cnp
 cimport cython
+from cython.parallel cimport prange
 
 from ._bp_binary_tree cimport *
 
@@ -1058,3 +1059,170 @@ def collapse_mask(_BPKernel k):
                     mask[k.close(current)] = 1
 
     return mask_arr, new_lengths
+
+
+# ---------------------------------------------------------------------------
+# Batch kernels (engine="cython")
+#
+# Each runs the compiled navigation primitives over an array of queries in an
+# OpenMP ``prange`` without the GIL; the queries are independent. Inputs are
+# validated by the ``BPTree`` methods that call these.
+# ---------------------------------------------------------------------------
+
+
+def close_batch(_BPKernel k, const Py_ssize_t[::1] idx):
+    """Kernel of :meth:`skbio.tree.BPTree.close_batch`."""
+    cdef:
+        Py_ssize_t t, n = idx.shape[0]
+        Py_ssize_t[::1] out
+    out_arr = np.empty(n, dtype=SIZE)
+    out = out_arr
+    for t in prange(n, nogil=True):
+        out[t] = k.close(idx[t])
+    return out_arr
+
+
+def parent_batch(_BPKernel k, const Py_ssize_t[::1] idx):
+    """Kernel of :meth:`skbio.tree.BPTree.parent_batch`."""
+    cdef:
+        Py_ssize_t t, n = idx.shape[0]
+        Py_ssize_t[::1] out
+    out_arr = np.empty(n, dtype=SIZE)
+    out = out_arr
+    for t in prange(n, nogil=True):
+        out[t] = k.parent(idx[t])
+    return out_arr
+
+
+def lca_batch(_BPKernel k, const Py_ssize_t[::1] i, const Py_ssize_t[::1] j):
+    """Kernel of :meth:`skbio.tree.BPTree.lca_batch`.
+
+    Each pair is ordered before the query, as ``lca`` requires ``i <= j``.
+    """
+    cdef:
+        Py_ssize_t t, n = i.shape[0]
+        Py_ssize_t[::1] out
+    out_arr = np.empty(n, dtype=SIZE)
+    out = out_arr
+    for t in prange(n, nogil=True):
+        out[t] = k.lca(min(i[t], j[t]), max(i[t], j[t]))
+    return out_arr
+
+
+def level_ancestor_batch(_BPKernel k, const Py_ssize_t[::1] idx,
+                        const Py_ssize_t[::1] d):
+    """Kernel of :meth:`skbio.tree.BPTree.level_ancestor_batch`."""
+    cdef:
+        Py_ssize_t t, n = idx.shape[0]
+        Py_ssize_t[::1] out
+    out_arr = np.empty(n, dtype=SIZE)
+    out = out_arr
+    for t in prange(n, nogil=True):
+        out[t] = k.level_ancestor(idx[t], d[t])
+    return out_arr
+
+
+def root_distances(_BPKernel k, const DOUBLE_t[::1] lengths):
+    """Sum of branch lengths from the root to each node.
+
+    Indexed by position; set at opening parentheses (0 elsewhere). The root's
+    own length is not included. Each node's value is its parent's plus its own
+    length, so every value is an exact root-to-node path sum.
+    """
+    cdef:
+        Py_ssize_t i, top = 0, n = k.size
+        DOUBLE_t[::1] out, stack
+    out_arr = np.zeros(n, dtype=DOUBLE)
+    out = out_arr
+    # distance of each open ancestor; the root is at depth 0
+    stack = np.zeros(n // 2 + 1, dtype=DOUBLE)
+    with nogil:
+        for i in range(1, n):
+            if k._b_ptr[i]:
+                top += 1
+                stack[top] = stack[top - 1] + lengths[i]
+                out[i] = stack[top]
+            else:
+                top -= 1
+    return out_arr
+
+
+def tip_distances(const Py_ssize_t[::1] tips, const Py_ssize_t[::1] slot,
+                  const Py_ssize_t[::1] parent, const Py_ssize_t[::1] end,
+                  const DOUBLE_t[::1] dist):
+    """Pairwise path distances between tips, as a square matrix.
+
+    Parameters
+    ----------
+    tips : array of intp
+        Positions (opening parentheses) of the tips, in tree order.
+    slot : array of intp
+        Row (and column) of the output for each tip of ``tips``.
+    parent : array of intp
+        Per-position parent position (at opening parentheses; -1 for the root).
+    end : array of intp
+        Per-position (at opening parentheses) exclusive end of the node's tips
+        in ``tips``: a node's tips are ``tips[start:end[v]]`` for some start.
+    dist : array of float64
+        Per-position distance from the root (branch lengths or edge counts).
+
+    Returns
+    -------
+    numpy.ndarray of float64, shape (n, n)
+        The symmetric distance matrix, zero on the diagonal.
+
+    Notes
+    -----
+    The tips of any node are contiguous in tree order. For tip ``a``, walking
+    up its ancestors, the tips after ``a`` within ancestor ``v`` but outside
+    the child of ``v`` containing ``a`` are exactly those whose lowest common
+    ancestor with ``a`` is ``v``: their distances are filled as one run, with
+    no search per pair. Each row is independent; rows ``h`` and ``n - 2 - h``
+    share a ``prange`` iteration to balance the triangular workload.
+    """
+    cdef:
+        Py_ssize_t n = tips.shape[0]
+        Py_ssize_t n_rows = n - 1 if n > 0 else 0
+        Py_ssize_t h
+        DOUBLE_t[:, ::1] out
+    out_arr = np.empty((n, n), dtype=DOUBLE)
+    out = out_arr
+    for h in prange((n_rows + 1) // 2, nogil=True, schedule='dynamic'):
+        _tip_distance_row(tips, slot, parent, end, dist, out, h, n)
+        if n_rows - 1 - h != h:
+            _tip_distance_row(tips, slot, parent, end, dist, out,
+                              n_rows - 1 - h, n)
+    if n:
+        out[slot[n - 1], slot[n - 1]] = 0
+    return out_arr
+
+
+cdef inline void _tip_distance_row(const Py_ssize_t[::1] tips,
+                                   const Py_ssize_t[::1] slot,
+                                   const Py_ssize_t[::1] parent,
+                                   const Py_ssize_t[::1] end,
+                                   const DOUBLE_t[::1] dist,
+                                   DOUBLE_t[:, ::1] out,
+                                   Py_ssize_t row, Py_ssize_t n) noexcept nogil:
+    """Fill the pairs of tip ``row`` with the tips after it."""
+    cdef:
+        Py_ssize_t col, v, stop, r, c
+        Py_ssize_t start = row + 1
+        DOUBLE_t da, dv, d
+    r = slot[row]
+    out[r, r] = 0
+    da = dist[tips[row]]
+    v = parent[tips[row]]
+    while start < n:
+        # tips start .. end[v] - 1 have lowest common ancestor v with this tip
+        stop = end[v]
+        dv = dist[v]
+        for col in range(start, stop):
+            # two differences (no multiply), so compilers cannot contract it
+            # into a fused multiply-add and every engine rounds identically
+            d = (da - dv) + (dist[tips[col]] - dv)
+            c = slot[col]
+            out[r, c] = d
+            out[c, r] = d
+        start = stop
+        v = parent[v]

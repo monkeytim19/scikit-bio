@@ -20,11 +20,13 @@ import numpy as np
 import numpy.testing as npt
 
 from skbio._base import SkbioObject
-from skbio.tree import BPTree
+from skbio._config import get_config, set_config
+from skbio.tree import BPTree, TreeNode
+from skbio.tree._exception import DuplicateNodeError, MissingNodeError
 from skbio.tree.bp import parse_newick
 from skbio.tree.bp._bp import _build_index, _build_index_xp, _KERNEL_METHODS
 from skbio.util._array import _to_numpy
-from skbio.util._testing import ArrayAPITestMixin, array_backends
+from skbio.util._testing import ArrayAPITestMixin, array_backends, numba_code
 import skbio.tree.tests.bp.test_bp_cy as tbc
 
 
@@ -644,6 +646,184 @@ class BPTreeClassTests(TestCase):
     def test_io_descriptors(self):
         self.assertIn('newick', BPTree.read.__doc__)
         self.assertIn('newick', self.bp.write.__doc__)
+
+
+def _named_tree(n_nodes, rng):
+    """Random tree with named tips and random branch lengths."""
+    B = _random_topology(n_nodes, rng)
+    tip = np.zeros(B.size, dtype=bool)
+    tip[:-1] = (B[:-1] == 1) & (B[1:] == 0)
+    names = np.full(B.size, None, dtype=object)
+    names[tip] = ['t%d' % k for k in range(tip.sum())]
+    lengths = rng.random(B.size)
+    return BPTree(B, lengths=lengths, names=names)
+
+
+class _BatchTests:
+    """Batch operations of one compute engine (``engine``)."""
+
+    engine = None
+
+    def setUp(self):
+        self.rng = np.random.default_rng(11)
+        self.trees = [BPTree(np.array([1, 0], dtype=np.uint8)),
+                      BPTree(_caterpillar(30))]
+        self.trees += [_named_tree(n, self.rng) for n in (2, 7, 64, 1500)]
+        # a named caterpillar: the deepest tree for its size
+        B = _caterpillar(200)
+        names = np.full(B.size, None, dtype=object)
+        names[np.flatnonzero(B[:-1] > B[1:])] = ['c%d' % k for k in range(200)]
+        self.trees.append(
+            BPTree(B, lengths=self.rng.random(B.size), names=names))
+
+    def test_close_parent_batch(self):
+        for bp in self.trees:
+            pos = np.arange(bp.data.size - 1)
+            npt.assert_array_equal(
+                bp.close_batch(pos, engine=self.engine),
+                [bp.close(int(i)) for i in pos])
+            npt.assert_array_equal(
+                bp.parent_batch(pos, engine=self.engine),
+                [bp.parent(int(i)) for i in pos])
+
+    def test_lca_batch(self):
+        for bp in self.trees:
+            n = bp.data.size
+            i = self.rng.integers(0, n, 500)
+            j = self.rng.integers(0, n, 500)
+            exp = [bp.lca(min(a, b), max(a, b)) for a, b in zip(i, j)]
+            npt.assert_array_equal(bp.lca_batch(i, j, engine=self.engine), exp)
+            # the order within a pair does not matter
+            npt.assert_array_equal(bp.lca_batch(j, i, engine=self.engine), exp)
+
+    def test_level_ancestor_batch(self):
+        for bp in self.trees:
+            pos = np.arange(bp.data.size - 1)
+            d = self.rng.integers(-1, 5, pos.size)
+            npt.assert_array_equal(
+                bp.level_ancestor_batch(pos, d, engine=self.engine),
+                [bp.level_ancestor(int(a), int(b)) for a, b in zip(pos, d)])
+            # a scalar level broadcasts
+            npt.assert_array_equal(
+                bp.level_ancestor_batch(pos, 1, engine=self.engine),
+                [bp.level_ancestor(int(a), 1) for a in pos])
+
+    def test_shapes(self):
+        bp = self.trees[-1]
+        pos = np.flatnonzero(bp.data)[:12].reshape(3, 4)
+        obs = bp.parent_batch(pos, engine=self.engine)
+        self.assertEqual(obs.shape, (3, 4))
+        self.assertEqual(obs.dtype, np.intp)
+        npt.assert_array_equal(obs.ravel(),
+                               bp.parent_batch(pos.ravel(), engine=self.engine))
+        # broadcasting a column against a row
+        obs = bp.lca_batch(pos[:, :1], pos[0], engine=self.engine)
+        self.assertEqual(obs.shape, (3, 4))
+        # a list and an empty input
+        self.assertEqual(
+            bp.close_batch([0], engine=self.engine).tolist(), [bp.close(0)])
+        self.assertEqual(bp.close_batch([], engine=self.engine).shape, (0,))
+
+    def test_invalid_positions(self):
+        bp = self.trees[-1]
+        with self.assertRaises(IndexError):
+            bp.close_batch([bp.data.size], engine=self.engine)
+        with self.assertRaises(IndexError):
+            bp.lca_batch([0], [-1], engine=self.engine)
+        with self.assertRaises(TypeError):
+            bp.parent_batch([1.5], engine=self.engine)
+        with self.assertRaises(TypeError):
+            bp.level_ancestor_batch([1], [1.0], engine=self.engine)
+
+    def test_cophenet_matches_treenode(self):
+        for bp in self.trees[2:]:
+            self.assertGreater(bp.count(tips=True), 0)
+            tn = TreeNode.from_bptree(bp)
+            for use_length in (True, False):
+                obs = bp.cophenet(use_length=use_length, engine=self.engine)
+                exp = tn.cophenet(use_length=use_length)
+                self.assertEqual(obs.ids, exp.ids)
+                npt.assert_allclose(obs.data, exp.data, rtol=1e-12, atol=1e-12)
+
+    def test_cophenet_endpoints(self):
+        bp = self.trees[-2]
+        tn = TreeNode.from_bptree(bp)
+        endpoints = ['t5', 't0', 't30', 't2']
+        obs = bp.cophenet(endpoints, engine=self.engine)
+        exp = tn.cophenet(endpoints)
+        self.assertEqual(obs.ids, tuple(endpoints))
+        npt.assert_allclose(obs.data, exp.data, rtol=1e-12, atol=1e-12)
+
+        # a large shuffled subset, on the deep tree as well
+        for bp in (self.trees[-2], self.trees[-1]):
+            tn = TreeNode.from_bptree(bp)
+            names = [tip.name for tip in tn.tips()]
+            endpoints = list(self.rng.permutation(names)[: len(names) // 2])
+            obs = bp.cophenet(endpoints, engine=self.engine)
+            exp = tn.cophenet(endpoints)
+            self.assertEqual(obs.ids, exp.ids)
+            npt.assert_allclose(obs.data, exp.data, rtol=1e-12, atol=1e-12)
+
+    def test_cophenet_errors(self):
+        bp = BPTree.read(["((a:1,b:2)c:3,(d:4,e:5)f:6)root;"])
+        with self.assertRaises(MissingNodeError):
+            bp.cophenet(['a', 'x'], engine=self.engine)
+        with self.assertRaises(DuplicateNodeError):
+            bp.cophenet(['a', 'b', 'a'], engine=self.engine)
+        with self.assertRaises(ValueError):
+            bp.cophenet(['a', 'c'], engine=self.engine)
+        dup = BPTree.read(["((a:1,a:2)c:3,d:4)root;"])
+        with self.assertRaises(DuplicateNodeError):
+            dup.cophenet(engine=self.engine)
+
+    def test_cophenet_few_tips(self):
+        B = np.array([1, 1, 0, 1, 0, 0], dtype=np.uint8)
+        obs = BPTree(B).cophenet(engine=self.engine)
+        self.assertEqual(obs.shape, (0, 0))
+        names = np.array([None, 'a', None, None, None, None], dtype=object)
+        obs = BPTree(B, names=names).cophenet(engine=self.engine)
+        self.assertEqual(obs.shape, (1, 1))
+        self.assertEqual(obs.ids, ('a',))
+
+
+class BPBatchCythonTests(_BatchTests, TestCase):
+    engine = 'cython'
+
+    def test_engine_resolution(self):
+        bp = self.trees[-1]
+        with self.assertRaises(ValueError):
+            bp.close_batch([0], engine='julia')
+        # "fast" and the global default resolve to an available engine
+        npt.assert_array_equal(bp.close_batch([0], engine='fast'),
+                               [bp.close(0)])
+        npt.assert_array_equal(bp.close_batch([0]), [bp.close(0)])
+
+
+@numba_code
+class BPBatchNumbaTests(_BatchTests, TestCase):
+    engine = 'numba'
+
+    def test_engines_identical(self):
+        # the engines run the same algorithm: identical results, bit for bit
+        for bp in self.trees:
+            n = bp.data.size
+            i = self.rng.integers(0, n, 300)
+            j = self.rng.integers(0, n, 300)
+            npt.assert_array_equal(bp.lca_batch(i, j, engine='numba'),
+                                   bp.lca_batch(i, j, engine='cython'))
+            for use_length in (True, False):
+                npt.assert_array_equal(
+                    bp.cophenet(use_length=use_length, engine='numba').data,
+                    bp.cophenet(use_length=use_length, engine='cython').data)
+
+    def test_global_engine(self):
+        bp = self.trees[-1]
+        default = get_config('compute_engine')
+        try:
+            set_config('compute_engine', 'numba')
+            npt.assert_array_equal(bp.close_batch([0]), [bp.close(0)])
+        finally:
+            set_config('compute_engine', default)
 
 
 if __name__ == '__main__':
