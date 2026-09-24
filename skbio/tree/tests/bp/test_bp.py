@@ -9,17 +9,61 @@
 # line length is useful here, so disabling check
 # flake8: noqa: E501
 
+import copy
 import io
 import os
+import pickle
 import tempfile
 from unittest import TestCase, main
 
 import numpy as np
 import numpy.testing as npt
 
+from skbio._base import SkbioObject
 from skbio.tree import BPTree
 from skbio.tree.bp import parse_newick
+from skbio.tree.bp._bp import _build_index, _build_index_xp, _KERNEL_METHODS
+from skbio.util._array import _to_numpy
+from skbio.util._testing import ArrayAPITestMixin, array_backends
 import skbio.tree.tests.bp.test_bp_cy as tbc
+
+
+def _random_topology(n_nodes, rng):
+    """Parentheses of a random tree with ``n_nodes`` nodes."""
+    # attach each new node under a uniformly chosen earlier node, then emit the
+    # parentheses by an iterative depth-first walk
+    children = [[] for _ in range(n_nodes)]
+    for v in range(1, n_nodes):
+        children[rng.integers(v)].append(v)
+    out = []
+    stack = [(0, False)]
+    while stack:
+        v, done = stack.pop()
+        if done:
+            out.append(0)
+            continue
+        out.append(1)
+        stack.append((v, True))
+        stack.extend((c, False) for c in reversed(children[v]))
+    return np.array(out, dtype=np.uint8)
+
+
+def _caterpillar(n_tips):
+    out = [1, 1, 0] * (n_tips - 1) + [1, 0] + [0] * (n_tips - 1)
+    return np.array(out, dtype=np.uint8)
+
+
+def _index_test_topologies():
+    rng = np.random.default_rng(42)
+    trees = [np.array([1, 0], dtype=np.uint8),  # a single node
+             np.array([1, 1, 0, 0], dtype=np.uint8),
+             np.array([1] + [1, 0] * 50 + [0], dtype=np.uint8)]  # a star
+    trees += [_caterpillar(n) for n in (2, 3, 17, 500)]
+    # sizes straddle rmM block and level boundaries
+    trees += [_random_topology(n, rng) for n in
+              (3, 4, 5, 7, 8, 9, 15, 16, 17, 31, 32, 33, 100, 257, 1000, 4097,
+               20000)]
+    return trees
 
 
 class BPCythonTests(TestCase):
@@ -417,6 +461,189 @@ class BPTests(TestCase):
             self.assertEqual(obs.name(i), self.bptree.name(i))
             self.assertEqual(obs.length(i), self.bptree.length(i))
         self.assertEqual(obs.count(tips=True), self.bptree.count(tips=True))
+
+
+class BPIndexTests(TestCase, ArrayAPITestMixin):
+    """The vectorized navigation index matches the scan-based construction."""
+
+    def assert_index_equal(self, obs, exp):
+        for key in ('e_index', 'k_index_0', 'k_index_1', 'm', 'M', 'r'):
+            npt.assert_array_equal(_to_numpy(obs[key]), exp[key],
+                                   err_msg=key)
+        self.assertEqual(obs['b'], exp['b'])
+        self.assertEqual(obs['height'], exp['height'])
+
+    def test_build_index_matches_reference(self):
+        # both the compiled (NumPy) and the array API construction
+        for B in _index_test_topologies():
+            exp = tbc.reference_index(B)
+            for builder in (_build_index, _build_index_xp):
+                with self.subTest(size=B.size, builder=builder.__name__):
+                    self.assert_index_equal(builder(B), exp)
+
+    def test_tree_index_matches_reference(self):
+        # the arrays held by the tree (and viewed by the kernel) are the index
+        for B in _index_test_topologies()[:8]:
+            bp = BPTree(B)
+            exp = tbc.reference_index(B)
+            for key in ('e_index', 'k_index_0', 'k_index_1', 'm', 'M', 'r'):
+                obs = getattr(bp, '_' + key)
+                npt.assert_array_equal(obs, exp[key], err_msg=key)
+                self.assertEqual(obs.dtype, np.intp)
+                self.assertFalse(obs.flags.writeable)
+
+    @array_backends("numpy", "jax", "torch", "cupy")
+    def test_build_index_backends(self, xp, device):
+        rng = np.random.default_rng(0)
+        for B in (_random_topology(300, rng), _caterpillar(40)):
+            arr = self.make_array(xp, device, B, dtype=xp.uint8)
+            obs = _build_index(arr)
+            for key in ('e_index', 'k_index_0', 'k_index_1', 'm', 'M', 'r'):
+                self.assert_type_preserved(obs[key], xp, device)
+            self.assert_index_equal(obs, tbc.reference_index(B))
+
+
+class BPTreeClassTests(TestCase):
+    """``BPTree`` is a Python class delegating navigation to its kernel."""
+
+    def setUp(self):
+        self.B = np.array([1, 1, 1, 0, 1, 0, 1, 1, 0, 0, 0, 1, 0, 1, 1, 1, 0,
+                           1, 0, 0, 0, 0], dtype=np.uint8)
+        self.names = np.array(['r', '2', '3', None, '4', None, '5', '6', None,
+                               None, None, '7', None, '8', '9', '10', None,
+                               '11', None, None, None, None])
+        self.lengths = np.arange(self.B.size, dtype=np.double)
+        self.bp = BPTree(self.B, lengths=self.lengths, names=self.names)
+
+    def test_skbio_object_subclass(self):
+        self.assertTrue(issubclass(BPTree, SkbioObject))
+        self.assertIn(SkbioObject, BPTree.__mro__)
+        self.assertEqual(str(self.bp), repr(self.bp))
+
+    def test_navigation_bound_to_kernel(self):
+        # instance lookups resolve to the compiled kernel's bound methods
+        for name in _KERNEL_METHODS:
+            meth = getattr(self.bp, name)
+            self.assertIs(meth.__self__, self.bp._kernel, name)
+
+    def test_class_methods_match_bound(self):
+        # the documented class-level methods give the same answers
+        for i in range(self.B.size - 1):
+            for name in ('close', 'parent', 'depth', 'is_tip', 'first_child',
+                         'last_child', 'next_sibling', 'previous_sibling',
+                         'preorder_rank', 'postorder_rank', 'deepest_node',
+                         'height', 'level_next', 'name', 'length', 'edge',
+                         'count'):
+                self.assertEqual(getattr(BPTree, name)(self.bp, i),
+                                 getattr(self.bp, name)(i), (name, i))
+        self.assertEqual(BPTree.lca(self.bp, 2, 7), self.bp.lca(2, 7))
+        self.assertEqual(BPTree.count(self.bp, 0, True),
+                         self.bp.count(0, tips=True))
+
+    def test_return_types(self):
+        self.assertIs(type(self.bp.length(1)), float)
+        self.assertIs(type(self.bp.edge(1)), int)
+        self.assertIs(type(self.bp.depth(1)), int)
+        self.assertIs(type(self.bp.name(1)), str)
+        self.assertIs(type(len(self.bp)), int)
+
+    def test_data_read_only_attribute(self):
+        npt.assert_array_equal(self.bp.data, self.B)
+        with self.assertRaises(AttributeError):
+            self.bp.data = self.B
+
+    def test_single_node(self):
+        bp = BPTree(np.array([1, 0], dtype=np.uint8))
+        self.assertEqual(len(bp), 1)
+        self.assertEqual(bp.close(0), 1)
+        self.assertEqual(bp.parent(0), -1)
+        self.assertEqual(bp.count(tips=True), 1)
+        self.assertTrue(bp.is_tip(0))
+
+    def test_invalid_input(self):
+        with self.assertRaises(TypeError):
+            BPTree([1, 0])
+        with self.assertRaises(ValueError):
+            BPTree(self.B.astype(np.int64))
+        with self.assertRaises(ValueError):
+            BPTree(np.array([], dtype=np.uint8))
+        with self.assertRaises(ValueError):
+            BPTree(self.B, names=self.names[:-1])
+        with self.assertRaises(ValueError):
+            BPTree(self.B, lengths=self.lengths.astype(np.float32))
+        with self.assertRaises(ValueError):
+            self.bp.set_edges(np.full(self.B.size, self.B.size, dtype=np.int32))
+        with self.assertRaises(TypeError):
+            self.bp.shear(['4'])
+
+    def test_bool_topology(self):
+        # accepted as uint8, as the compiled class always did (e.g. trees
+        # saved from one built from a bool array)
+        B = self.B.astype(bool)
+        bp = BPTree(B, lengths=self.lengths, names=self.names)
+        self.assertEqual(bp.data.dtype, np.uint8)
+        self.assertTrue(np.shares_memory(bp.data, B))
+        npt.assert_array_equal(bp.data, self.B)
+        for i in range(self.B.size):
+            self.assertEqual(bp.close(i), self.bp.close(i))
+            self.assertEqual(bp.parent(i), self.bp.parent(i))
+        # non-contiguous too
+        wide = np.zeros(2 * self.B.size, dtype=bool)
+        wide[::2] = B
+        npt.assert_array_equal(BPTree(wide[::2]).data, self.B)
+
+        # a saved tree whose topology is bool: .npz and pickle
+        with io.BytesIO() as fh:
+            np.savez_compressed(fh, names=self.names, lengths=self.lengths, B=B)
+            fh.seek(0)
+            obs = BPTree.from_npz(fh)
+        npt.assert_array_equal(obs.data, self.B)
+        self.assertEqual(obs.name(2), self.bp.name(2))
+
+        class Saved:  # pickles as a tree pickled with a bool topology does
+            def __reduce__(self_):
+                return BPTree, (B, self.lengths, self.names)
+
+        obs = pickle.loads(pickle.dumps(Saved()))
+        self.assertIsInstance(obs, BPTree)
+        npt.assert_array_equal(obs.data, self.B)
+
+    def test_non_contiguous_topology(self):
+        wide = np.zeros(2 * self.B.size, dtype=np.uint8)
+        wide[::2] = self.B
+        bp = BPTree(wide[::2])
+        npt.assert_array_equal(bp.data, self.B)
+        self.assertEqual(bp.close(1), 10)
+
+    def test_set_attributes_update_kernel(self):
+        names = np.full(self.B.size, None, dtype=object)
+        names[1] = 'x'
+        self.bp.set_names(names)
+        self.assertEqual(self.bp.name(1), 'x')
+
+        lengths = np.zeros(self.B.size, dtype=np.double)
+        lengths[1] = 2.5
+        self.bp.set_lengths(lengths)
+        self.assertEqual(self.bp.length(1), 2.5)
+
+        edges = np.arange(self.B.size, dtype=np.int32)
+        self.bp.set_edges(edges)
+        self.assertEqual(self.bp.edge(4), 4)
+        self.assertEqual(self.bp.edge_from_number(4), 4)
+
+    def test_pickle_and_copy(self):
+        for obs in (pickle.loads(pickle.dumps(self.bp)), copy.copy(self.bp),
+                    copy.deepcopy(self.bp)):
+            self.assertIsNot(obs._kernel, self.bp._kernel)
+            npt.assert_array_equal(obs.data, self.bp.data)
+            for i in range(self.B.size):
+                self.assertEqual(obs.name(i), self.bp.name(i))
+                self.assertEqual(obs.length(i), self.bp.length(i))
+                self.assertEqual(obs.close(i), self.bp.close(i))
+
+    def test_io_descriptors(self):
+        self.assertIn('newick', BPTree.read.__doc__)
+        self.assertIn('newick', self.bp.write.__doc__)
 
 
 if __name__ == '__main__':

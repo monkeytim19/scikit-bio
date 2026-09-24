@@ -194,9 +194,10 @@ extensions += [
         ["skbio/tree/bp/_ba.pyx", _bitarray_c],
         include_dirs=_bp_includes,
     ),
+    # compiled engine of the (pure-Python) BPTree class
     Extension(
-        "skbio.tree.bp._bp",
-        ["skbio/tree/bp/_bp.pyx", _bitarray_c],
+        "skbio.tree.bp._bp_cy",
+        ["skbio/tree/bp/_bp_cy.pyx"],
         include_dirs=_bp_includes,
     ),
     Extension(

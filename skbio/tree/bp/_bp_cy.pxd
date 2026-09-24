@@ -12,47 +12,37 @@
 cimport numpy as cnp
 cimport cython
 
-from ._ba cimport BIT_ARRAY
-
 ctypedef cnp.uint32_t UINT32_t
 ctypedef cnp.int32_t INT32_t
 ctypedef cnp.float64_t DOUBLE_t
 ctypedef cnp.uint8_t BOOL_t
 
 
-cdef class mM:
-    cdef Py_ssize_t b  # block size (Py_ssize_t so block-index * block-size products stay 64-bit)
-    cdef Py_ssize_t n_tip  # number of tips in the binary tree
-    cdef Py_ssize_t n_internal  # number of internal nodes in the binary tree
-    cdef Py_ssize_t n_total  # total number of nodes in the binary tree
-    cdef Py_ssize_t height  # the height of the binary tree
-    cdef Py_ssize_t m_idx  # m is minimum excess
-    cdef Py_ssize_t M_idx  # M is maximum excess
-    cdef Py_ssize_t r_idx  # rank
-    cdef Py_ssize_t[:, ::1] mM
-    cdef Py_ssize_t[:] r
-
-    cdef void rmm(self, BOOL_t[:] B, Py_ssize_t B_size) nogil
-
-
 @cython.final
-cdef class BPTree:
+cdef class _BPKernel:
     cdef:
-        public cnp.ndarray data
-        BOOL_t* _b_ptr
-        Py_ssize_t[:] _e_index
-        Py_ssize_t[:] _k_index_0
-        Py_ssize_t[:] _k_index_1
-        cnp.ndarray _names
-        cnp.ndarray _lengths
-        cnp.ndarray _edges
-        cnp.ndarray _edge_lookup
-        mM _rmm
+        # read-only views onto the arrays owned by the Python ``BPTree``
+        const BOOL_t[::1] _B
+        const BOOL_t* _b_ptr
+        const Py_ssize_t[::1] _e_index
+        const Py_ssize_t[::1] _k_index_0
+        const Py_ssize_t[::1] _k_index_1
+        # range min-max (rmM) tree, in heap (breadth-first) order
+        const Py_ssize_t[::1] _m
+        const Py_ssize_t[::1] _M
+        const Py_ssize_t[::1] _r
+        Py_ssize_t _b  # rmM block size
+        Py_ssize_t _height  # rmM tree height
+        Py_ssize_t _n_internal  # rmM internal node count
         Py_ssize_t size
+        # node attributes, replaced in place by ``BPTree.set_*``
+        public cnp.ndarray _names
+        public cnp.ndarray _lengths
+        public cnp.ndarray _edges
+        public object _edge_lookup
 
     cdef inline Py_ssize_t rank(self, Py_ssize_t t, Py_ssize_t i) nogil
     cdef inline Py_ssize_t select(self, Py_ssize_t t, Py_ssize_t k) nogil
-    cdef Py_ssize_t _excess(self, Py_ssize_t i) nogil
     cdef Py_ssize_t excess(self, Py_ssize_t i) nogil
     cdef Py_ssize_t fwdsearch(self, Py_ssize_t i, Py_ssize_t d) nogil
     cdef Py_ssize_t bwdsearch(self, Py_ssize_t i, Py_ssize_t d) nogil
@@ -60,7 +50,6 @@ cdef class BPTree:
     cdef inline Py_ssize_t open(self, Py_ssize_t i) nogil
     cpdef inline BOOL_t is_tip(self, Py_ssize_t i) nogil
     cdef inline Py_ssize_t enclose(self, Py_ssize_t i) nogil
-    cdef BPTree _mask_from_self(self, BIT_ARRAY* mask, cnp.ndarray[DOUBLE_t, ndim=1] lengths)
     cpdef Py_ssize_t next_sibling(self, Py_ssize_t i) nogil
     cpdef Py_ssize_t previous_sibling(self, Py_ssize_t i) nogil
     cpdef Py_ssize_t last_child(self, Py_ssize_t i) nogil
@@ -70,7 +59,6 @@ cdef class BPTree:
     cpdef Py_ssize_t root(self) nogil
     cdef Py_ssize_t scan_block_forward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) nogil
     cdef Py_ssize_t scan_block_backward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) nogil
-    cdef void _set_edges(self, cnp.ndarray[INT32_t, ndim=1] edges)
 
     cpdef inline unicode name(self, Py_ssize_t i)
     cpdef inline DOUBLE_t length(self, Py_ssize_t i)
@@ -87,8 +75,6 @@ cdef class BPTree:
     cpdef BOOL_t is_ancestor(self, Py_ssize_t i, Py_ssize_t j) nogil
     cpdef Py_ssize_t level_ancestor(self, Py_ssize_t i, Py_ssize_t d) nogil
     cpdef Py_ssize_t count(self, Py_ssize_t i=*, bint tips=*) nogil
-    cpdef BPTree shear(self, set tips)
-    cpdef BPTree collapse(self)
     cpdef Py_ssize_t level_next(self, Py_ssize_t i) nogil
     cpdef Py_ssize_t height(self, Py_ssize_t i) nogil
     cpdef Py_ssize_t deepest_node(self, Py_ssize_t i) nogil
