@@ -48,14 +48,14 @@ BOOL = np.uint8
 INT32 = np.int32
 
 
-cdef inline Py_ssize_t min(Py_ssize_t a, Py_ssize_t b) nogil:
+cdef inline Py_ssize_t min(Py_ssize_t a, Py_ssize_t b) noexcept nogil:
     if a > b:
         return b
     else:
         return a
 
 
-cdef inline Py_ssize_t max(Py_ssize_t a, Py_ssize_t b) nogil:
+cdef inline Py_ssize_t max(Py_ssize_t a, Py_ssize_t b) noexcept nogil:
     if a > b:
         return a
     else:
@@ -113,7 +113,7 @@ cdef class _BPKernel:
         """Node index of edge number ``n``."""
         return self._edge_lookup[n]
 
-    cdef inline Py_ssize_t rank(self, Py_ssize_t t, Py_ssize_t i) nogil:
+    cdef inline Py_ssize_t rank(self, Py_ssize_t t, Py_ssize_t i) noexcept nogil:
         """Determine the rank order of the ith bit t
 
         Rank is the order of the ith bit observed, from left to right. For
@@ -160,19 +160,19 @@ cdef class _BPKernel:
         else:
             return (i - r) + 1
 
-    cdef inline Py_ssize_t select(self, Py_ssize_t t, Py_ssize_t k) nogil:
+    cdef inline Py_ssize_t select(self, Py_ssize_t t, Py_ssize_t k) noexcept nogil:
         """The position in B of the kth occurrence of the bit t."""
         if t:
             return self._k_index_1[k]
         else:
             return self._k_index_0[k]
 
-    cdef Py_ssize_t excess(self, Py_ssize_t i) nogil:
+    cdef Py_ssize_t excess(self, Py_ssize_t i) noexcept nogil:
         """the number of opening minus closing parentheses in B[1, i]"""
         # same as: self.rank(1, i) - self.rank(0, i)
         return self._e_index[i]
 
-    cpdef inline Py_ssize_t close(self, Py_ssize_t i) nogil:
+    cpdef inline Py_ssize_t close(self, Py_ssize_t i) noexcept nogil:
         """The position of the closing parenthesis that matches B[i]"""
         if not self._b_ptr[i]:
             # identity: the close of a closed parenthesis is itself
@@ -180,7 +180,7 @@ cdef class _BPKernel:
 
         return self.fwdsearch(i, -1)
 
-    cdef inline Py_ssize_t open(self, Py_ssize_t i) nogil:
+    cdef inline Py_ssize_t open(self, Py_ssize_t i) noexcept nogil:
         """The position of the opening parenthesis that matches B[i]"""
         if self._b_ptr[i] or i <= 0:
             # identity: the open of an open parenthesis is itself
@@ -189,14 +189,14 @@ cdef class _BPKernel:
 
         return self.bwdsearch(i, 0) + 1
 
-    cdef inline Py_ssize_t enclose(self, Py_ssize_t i) nogil:
+    cdef inline Py_ssize_t enclose(self, Py_ssize_t i) noexcept nogil:
         """The opening parenthesis of the smallest matching pair that contains position i"""
         if self._b_ptr[i]:
             return self.bwdsearch(i, -2) + 1
         else:
             return self.bwdsearch(i - 1, -2) + 1
 
-    cpdef Py_ssize_t rmq(self, Py_ssize_t i, Py_ssize_t j) nogil:
+    cpdef Py_ssize_t rmq(self, Py_ssize_t i, Py_ssize_t j) noexcept nogil:
         """The leftmost minimum excess in i -> j.
 
         The minimum excess over [i, j] is found in O(log n): the two partial
@@ -245,7 +245,7 @@ cdef class _BPKernel:
             return i
         return self.fwdsearch(i, d_star - e_i)
 
-    cpdef Py_ssize_t rMq(self, Py_ssize_t i, Py_ssize_t j) nogil:
+    cpdef Py_ssize_t rMq(self, Py_ssize_t i, Py_ssize_t j) noexcept nogil:
         """The leftmost maximmum excess in i -> j.
 
         Symmetric to :meth:`rmq`: an O(log n) range-maximum over the rmM tree
@@ -290,7 +290,7 @@ cdef class _BPKernel:
         return self.fwdsearch(i, m_star - e_i)
 
     cdef Py_ssize_t _rmq_tree_min(self, Py_ssize_t node, Py_ssize_t node_lo, Py_ssize_t node_hi,
-                              Py_ssize_t lo, Py_ssize_t hi) nogil:
+                              Py_ssize_t lo, Py_ssize_t hi) noexcept nogil:
         """Minimum excess over leaf-blocks [lo, hi].
 
         Segment-tree range query over the rmM binary tree; ``node`` spans the
@@ -314,7 +314,7 @@ cdef class _BPKernel:
         return left_v if left_v < right_v else right_v
 
     cdef Py_ssize_t _rmq_tree_max(self, Py_ssize_t node, Py_ssize_t node_lo, Py_ssize_t node_hi,
-                              Py_ssize_t lo, Py_ssize_t hi) nogil:
+                              Py_ssize_t lo, Py_ssize_t hi) noexcept nogil:
         """Maximum excess over leaf-blocks [lo, hi].
 
         The range-maximum counterpart of :meth:`_rmq_tree_min`; see its note on
@@ -333,26 +333,26 @@ cdef class _BPKernel:
                                      lo, hi)
         return left_v if left_v > right_v else right_v
 
-    cpdef Py_ssize_t depth(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t depth(self, Py_ssize_t i) noexcept nogil:
         """The depth of node ``i``."""
         return self._e_index[i]
 
-    cpdef Py_ssize_t root(self) nogil:
+    cpdef Py_ssize_t root(self) noexcept nogil:
         """The index of the root node of the tree."""
         return 0
 
-    cpdef Py_ssize_t parent(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t parent(self, Py_ssize_t i) noexcept nogil:
         """The parent of node ``i``, or -1 for the root."""
         if i == self.root() or i == (self.size - 1):
             return -1
         else:
             return self.enclose(i)
 
-    cpdef BOOL_t is_tip(self, Py_ssize_t i) nogil:
+    cpdef BOOL_t is_tip(self, Py_ssize_t i) noexcept nogil:
         """Whether node ``i`` is a tip."""
         return self._b_ptr[i] and (not self._b_ptr[i + 1])
 
-    cpdef Py_ssize_t first_child(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t first_child(self, Py_ssize_t i) noexcept nogil:
         """Index of the first child of node ``i``, or 0 for a tip."""
         if self._b_ptr[i]:
             if self.is_tip(i):
@@ -362,7 +362,7 @@ cdef class _BPKernel:
         else:
             return self.first_child(self.open(i))
 
-    cpdef Py_ssize_t last_child(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t last_child(self, Py_ssize_t i) noexcept nogil:
         """Index of the last child of node ``i``, or 0 for a tip."""
         if self._b_ptr[i]:
             if self.is_tip(i):
@@ -372,7 +372,7 @@ cdef class _BPKernel:
         else:
             return self.last_child(self.open(i))
 
-    cpdef Py_ssize_t next_sibling(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t next_sibling(self, Py_ssize_t i) noexcept nogil:
         """Index of the next sibling of node ``i``, or 0 if none."""
         cdef Py_ssize_t pos
 
@@ -388,7 +388,7 @@ cdef class _BPKernel:
         else:
             return 0
 
-    cpdef Py_ssize_t previous_sibling(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t previous_sibling(self, Py_ssize_t i) noexcept nogil:
         """Index of the previous sibling of node ``i``, or 0 if none."""
         cdef Py_ssize_t pos
 
@@ -407,29 +407,29 @@ cdef class _BPKernel:
         else:
             return 0
 
-    cpdef Py_ssize_t preorder_rank(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t preorder_rank(self, Py_ssize_t i) noexcept nogil:
         """Preorder rank of node ``i``."""
         if self._b_ptr[i]:
             return self.rank(1, i)
         else:
             return self.preorder_rank(self.open(i))
 
-    cpdef Py_ssize_t preorder_select(self, Py_ssize_t k) nogil:
+    cpdef Py_ssize_t preorder_select(self, Py_ssize_t k) noexcept nogil:
         """Index of the node with preorder rank ``k``."""
         return self.select(1, k)
 
-    cpdef Py_ssize_t postorder_rank(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t postorder_rank(self, Py_ssize_t i) noexcept nogil:
         """Postorder rank of node ``i``."""
         if self._b_ptr[i]:
             return self.rank(0, self.close(i))
         else:
             return self.rank(0, i)
 
-    cpdef Py_ssize_t postorder_select(self, Py_ssize_t k) nogil:
+    cpdef Py_ssize_t postorder_select(self, Py_ssize_t k) noexcept nogil:
         """Index of the node with postorder rank ``k``."""
         return self.open(self.select(0, k))
 
-    cpdef BOOL_t is_ancestor(self, Py_ssize_t i, Py_ssize_t j) nogil:
+    cpdef BOOL_t is_ancestor(self, Py_ssize_t i, Py_ssize_t j) noexcept nogil:
         """Whether node ``i`` is an ancestor of node ``j``."""
         if i == j:
             return False
@@ -439,7 +439,7 @@ cdef class _BPKernel:
 
         return i <= j < self.close(i)
 
-    cpdef Py_ssize_t count(self, Py_ssize_t i=0, bint tips=False) nogil:
+    cpdef Py_ssize_t count(self, Py_ssize_t i=0, bint tips=False) noexcept nogil:
         """Count of nodes (or tips) in the subtree rooted at node ``i``."""
         cdef:
             Py_ssize_t last, j, c
@@ -463,7 +463,7 @@ cdef class _BPKernel:
 
         return c
 
-    cpdef Py_ssize_t level_ancestor(self, Py_ssize_t i, Py_ssize_t d) nogil:
+    cpdef Py_ssize_t level_ancestor(self, Py_ssize_t i, Py_ssize_t d) noexcept nogil:
         """Index of the ancestor ``d`` levels above node ``i``."""
         if d <= 0:
             return -1
@@ -473,11 +473,11 @@ cdef class _BPKernel:
 
         return self.bwdsearch(i, -d - 1) + 1
 
-    cpdef Py_ssize_t level_next(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t level_next(self, Py_ssize_t i) noexcept nogil:
         """Index of the next node at the same depth as node ``i``."""
         return self.fwdsearch(self.close(i), 1)
 
-    cpdef Py_ssize_t lca(self, Py_ssize_t i, Py_ssize_t j) nogil:
+    cpdef Py_ssize_t lca(self, Py_ssize_t i, Py_ssize_t j) noexcept nogil:
         """The lowest common ancestor of nodes ``i`` and ``j``."""
         if self.is_ancestor(i, j):
             return i
@@ -486,15 +486,15 @@ cdef class _BPKernel:
         else:
             return self.parent(self.rmq(i, j) + 1)
 
-    cpdef Py_ssize_t deepest_node(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t deepest_node(self, Py_ssize_t i) noexcept nogil:
         """Index of the deepest node descending from node ``i``."""
         return self.rMq(self.open(i), self.close(i))
 
-    cpdef Py_ssize_t height(self, Py_ssize_t i) nogil:
+    cpdef Py_ssize_t height(self, Py_ssize_t i) noexcept nogil:
         """The height of node ``i``, in edges."""
         return self.excess(self.deepest_node(i)) - self.excess(self.open(i))
 
-    cdef Py_ssize_t scan_block_forward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) nogil:
+    cdef Py_ssize_t scan_block_forward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) noexcept nogil:
         """Scan a block forward from i.
 
         Parameters
@@ -531,7 +531,7 @@ cdef class _BPKernel:
 
         return -1
 
-    cdef Py_ssize_t scan_block_backward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) nogil:
+    cdef Py_ssize_t scan_block_backward(self, Py_ssize_t i, Py_ssize_t k, Py_ssize_t b, Py_ssize_t d) noexcept nogil:
         """Scan a block backward from i.
 
         Parameters
@@ -577,7 +577,7 @@ cdef class _BPKernel:
 
         return -1
 
-    cdef Py_ssize_t fwdsearch(self, Py_ssize_t i, Py_ssize_t d) nogil:
+    cdef Py_ssize_t fwdsearch(self, Py_ssize_t i, Py_ssize_t d) noexcept nogil:
         """Search forward from i for desired excess.
 
         Parameters
@@ -639,7 +639,7 @@ cdef class _BPKernel:
 
         return result
 
-    cdef Py_ssize_t bwdsearch(self, Py_ssize_t i, Py_ssize_t d) nogil:
+    cdef Py_ssize_t bwdsearch(self, Py_ssize_t i, Py_ssize_t d) noexcept nogil:
         """Search backward from i for desired excess
 
         Parameters
