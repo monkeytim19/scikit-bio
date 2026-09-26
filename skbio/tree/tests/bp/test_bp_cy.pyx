@@ -443,3 +443,29 @@ def reference_index(cnp.ndarray[BOOL_t, ndim=1] B):
             'k_index_1': k_index_1, 'm': np.asarray(mM[:, 0]),
             'M': np.asarray(mM[:, 1]), 'r': np.asarray(rr), 'b': b,
             'height': height}
+
+
+def kernel_index_op(tree, str op, Py_ssize_t a, Py_ssize_t b=0):
+    """Call an index operation of the Cython engine that Python cannot reach.
+
+    The oracle of the Numba engine's parity tests (``test_bp_numba``) for the
+    ``cdef`` methods of ``_BPKernel``: ``rank(t, i)``, ``select(t, k)``,
+    ``excess(i)``, ``fwdsearch(i, d)``, ``bwdsearch(i, d)``, ``open(i)`` and
+    ``enclose(i)``.
+    """
+    cdef _BPKernel k = tree._kernel
+    if op == "rank":
+        return k.rank(a, b)
+    elif op == "select":
+        return k.select(a, b)
+    elif op == "excess":
+        return k.excess(a)
+    elif op == "fwdsearch":
+        return k.fwdsearch(a, b)
+    elif op == "bwdsearch":
+        return k.bwdsearch(a, b)
+    elif op == "open":
+        return k.open(a)
+    elif op == "enclose":
+        return k.enclose(a)
+    raise ValueError(op)

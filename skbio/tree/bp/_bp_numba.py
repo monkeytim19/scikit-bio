@@ -13,13 +13,39 @@
 
 The navigation primitives of the Cython engine (``_bp_cy._BPKernel``), ported
 to Numba functions over the tree's flat arrays, and the batch kernels built on
-them. The primitives follow the Cython implementation line by line, with one
-exception: the range query over the range min-max (rmM) tree is iterative
-(bottom-up) instead of recursive. It visits a different but equivalent set of
-nodes, covering the same blocks, so it returns the same value.
+them.
 
-Numba is an optional dependency; everything here is defined only if it is
-installed (``NUMBA_AVAILABLE``).
+Primitives
+----------
+Every navigation operation of ``BPTree`` has a primitive here, together with
+the index operations they are built from (``rank``, ``select``, ``excess``,
+``fwdsearch``, ``bwdsearch``, ``open``, ``enclose``). Each takes the tree's
+arrays as a :class:`BPArrays` ``T`` and returns what the ``BPTree`` method of
+the same name returns, with ``-1`` in place of ``None`` (``minselect``) and a
+boolean for ``is_tip`` and ``is_ancestor``. Node attributes are not
+primitives: a kernel reads ``lengths[i]``, ``edges[i]`` or
+``edge_lookup[n]`` directly, and names (Python objects) stay on the host.
+
+The primitives follow the Cython implementation, with two differences in
+form but not in result: the range queries over the range min-max (rmM) tree
+are iterative (bottom-up) rather than recursive, visiting a different but
+equivalent set of nodes that covers the same blocks; and the methods that
+recurse once to handle a closing parenthesis instead move to the matching
+opening parenthesis first.
+
+They are meant to be called from compiled code: a batch kernel, a per-sample
+kernel, or a user's own ``@njit`` function. A single call from Python pays
+Numba's argument dispatch (about a microsecond), far more than the operation
+itself, which is why ``BPTree``'s per-node methods use the Cython engine.
+
+Single source for CPU and GPU
+-----------------------------
+The primitives are written once, in :func:`define_primitives`, and compiled
+by the decorator it is given.
+
+Numba is an optional dependency: :func:`define_primitives` and
+:func:`bp_arrays` are always defined, while :data:`CPU` and the batch kernels
+are defined only if it is installed (``NUMBA_AVAILABLE``).
 """
 
 from collections import namedtuple
@@ -53,9 +79,23 @@ BPArrays = namedtuple(
 )
 
 
-def bp_arrays(tree):
-    """Collect the arrays of a :class:`~skbio.tree.BPTree` for the kernels."""
-    return BPArrays(
+def bp_arrays(tree, asarray=None):
+    """Collect the arrays of a :class:`~skbio.tree.BPTree` for the kernels.
+
+    Parameters
+    ----------
+    tree : skbio.tree.BPTree
+        The tree.
+    asarray : callable, optional
+        Applied to each array, e.g. ``numba.cuda.to_device`` to place them on
+        a GPU. By default the tree's own (host) arrays are used as they are.
+
+    Returns
+    -------
+    BPArrays
+        The arrays and rmM-tree geometry of the tree.
+    """
+    arrays = (
         tree._data,
         tree._e_index,
         tree._k_index_0,
@@ -63,6 +103,11 @@ def bp_arrays(tree):
         tree._m,
         tree._M,
         tree._r,
+    )
+    if asarray is not None:
+        arrays = tuple(asarray(a) for a in arrays)
+    return BPArrays(
+        *arrays,
         tree._b,
         tree._height,
         (1 << tree._height) - 1,
@@ -70,147 +115,101 @@ def bp_arrays(tree):
     )
 
 
-if NUMBA_AVAILABLE:
-    _SIZE_MAX = np.iinfo(np.intp).max
+# The primitives, by name; see the module docstring.
+Primitives = namedtuple(
+    "Primitives",
+    [
+        # index operations
+        "rank",
+        "select",
+        "excess",
+        "fwdsearch",
+        "bwdsearch",
+        "open",
+        "close",
+        "enclose",
+        "rmq",
+        "rMq",
+        "mincount",
+        "minselect",
+        # navigation
+        "root",
+        "depth",
+        "parent",
+        "is_tip",
+        "first_child",
+        "last_child",
+        "next_sibling",
+        "previous_sibling",
+        "preorder_rank",
+        "preorder_select",
+        "postorder_rank",
+        "postorder_select",
+        "is_ancestor",
+        "count",
+        "level_ancestor",
+        "level_next",
+        "lca",
+        "deepest_node",
+        "height",
+    ],
+)
 
-    # -- complete binary tree in breadth-first (heap) order -------------------
+# Sentinels of the rmM-tree range queries (an empty range).
+_SIZE_MAX = int(np.iinfo(np.intp).max)
 
-    @njit(inline="always")
-    def _bt_is_root(v):
+
+def define_primitives(jit, jit_inline=None):
+    """Compile the navigation primitives with a Numba decorator.
+
+    Parameters
+    ----------
+    jit : callable
+        The decorator compiling each primitive: ``numba.njit`` for the CPU, or
+        ``gpu.jit(device=True)`` for device functions of a Numba GPU module.
+    jit_inline : callable, optional
+        The decorator for the one-line helpers on the rmM tree's node indices,
+        e.g. ``numba.njit(inline="always")``. Defaults to ``jit``.
+
+    Returns
+    -------
+    Primitives
+        The compiled primitives. Each calls the others through this closure,
+        so a set is compiled as a whole for one target.
+    """
+    if jit_inline is None:
+        jit_inline = jit
+
+    # -- the rmM tree: a complete binary tree in breadth-first (heap) order ----
+
+    @jit_inline
+    def bt_is_root(v):
         return v == 0
 
-    @njit(inline="always")
-    def _bt_is_left_child(v):
+    @jit_inline
+    def bt_is_left_child(v):
         return 0 if v == 0 else v % 2
 
-    @njit(inline="always")
-    def _bt_is_right_child(v):
+    @jit_inline
+    def bt_is_right_child(v):
         return 0 if v == 0 else 1 - (v % 2)
 
-    @njit(inline="always")
-    def _bt_parent(v):
+    @jit_inline
+    def bt_parent(v):
         return 0 if v == 0 else (v - 1) // 2
 
-    @njit(inline="always")
-    def _bt_is_leaf(v, n_internal):
+    @jit_inline
+    def bt_is_leaf(v, n_internal):
         return v >= n_internal
 
-    # -- primitives -----------------------------------------------------------
+    @jit
+    def tree_min(T, lo, hi):
+        """Minimum excess over the rmM leaf blocks ``[lo, hi]`` (bottom-up).
 
-    @njit
-    def _scan_block_forward(T, i, k, d):
-        lower = max(max(k, 0) * T.b, i + 1)
-        upper = min((k + 1) * T.b, T.size)
-        for j in range(lower, upper):
-            if T.e_index[j] == d:
-                return j
-        return -1
-
-    @njit
-    def _scan_block_backward(T, i, k, d):
-        lower = max(k, 0) * T.b - 1
-        if lower >= 0:
-            lower -= 1
-        upper = min((k + 1) * T.b, T.size) - 1
-        upper = min(i - 1, upper)
-        if upper <= 0:
-            return -1
-        for j in range(upper, lower, -1):
-            if T.e_index[j] == d:
-                return j
-        return -1
-
-    @njit
-    def _fwdsearch(T, i, d):
-        """Position after ``i`` with excess ``excess(i) + d``, or -1."""
-        k = i // T.b
-        d += T.e_index[i]
-        node = T.n_internal + k
-        result = -1
-        if T.m[node] <= d <= T.M[node]:
-            result = _scan_block_forward(T, i, k, d)
-        if result == -1:
-            while not _bt_is_root(node):
-                if _bt_is_left_child(node):
-                    node += 1
-                    if T.m[node] <= d <= T.M[node]:
-                        break
-                node = _bt_parent(node)
-            if _bt_is_root(node):
-                return -1
-            while not _bt_is_leaf(node, T.n_internal):
-                node = 2 * node + 1
-                if not (T.m[node] <= d <= T.M[node]):
-                    node += 1
-            k = node - T.n_internal
-            result = _scan_block_forward(T, i, k, d)
-        return result
-
-    @njit
-    def _bwdsearch(T, i, d):
-        """Position before ``i`` with excess ``excess(i) + d``, or -1."""
-        k = i // T.b
-        d += T.e_index[i]
-        result = _scan_block_backward(T, i, k, d)
-        node = T.n_internal + k
-        if result == -1 and _bt_is_right_child(node):
-            node -= 1
-            k = node - T.n_internal
-            result = _scan_block_backward(T, i, k, d)
-            k = i // T.b
-            node += 1
-        if result == -1:
-            while not _bt_is_root(node):
-                if _bt_is_right_child(node):
-                    node -= 1
-                    if T.m[node] <= d <= T.M[node]:
-                        break
-                node = _bt_parent(node)
-            if _bt_is_root(node):
-                return -1
-            while not _bt_is_leaf(node, T.n_internal):
-                node = 2 * node + 2
-                if not (T.m[node] <= d <= T.M[node]):
-                    node -= 1
-            k = node - T.n_internal
-            result = _scan_block_backward(T, i, k, d)
-        return result
-
-    @njit
-    def _close(T, i):
-        if not T.B[i]:
-            return i
-        return _fwdsearch(T, i, -1)
-
-    @njit
-    def _open(T, i):
-        if T.B[i] or i <= 0:
-            return i
-        return _bwdsearch(T, i, 0) + 1
-
-    @njit
-    def _enclose(T, i):
-        if T.B[i]:
-            return _bwdsearch(T, i, -2) + 1
-        return _bwdsearch(T, i - 1, -2) + 1
-
-    @njit
-    def _parent(T, i):
-        if i == 0 or i == T.size - 1:
-            return -1
-        return _enclose(T, i)
-
-    @njit
-    def _is_ancestor(T, i, j):
-        if i == j:
-            return False
-        if not T.B[i]:
-            i = _open(T, i)
-        return i <= j < _close(T, i)
-
-    @njit
-    def _tree_min(T, lo, hi):
-        """Minimum excess over the rmM leaf blocks ``[lo, hi]`` (bottom-up)."""
+        Only fully covered nodes are read. Every block in ``[lo, hi]`` is a
+        real block, as the callers pass interior blocks only (see
+        ``_BPKernel._rmq_tree_min``).
+        """
         res = _SIZE_MAX
         lo += T.n_internal
         hi += T.n_internal
@@ -225,8 +224,150 @@ if NUMBA_AVAILABLE:
             hi = (hi - 1) // 2
         return res
 
-    @njit
-    def _rmq(T, i, j):
+    @jit
+    def tree_max(T, lo, hi):
+        """Maximum excess over the rmM leaf blocks ``[lo, hi]`` (bottom-up)."""
+        res = -_SIZE_MAX
+        lo += T.n_internal
+        hi += T.n_internal
+        while lo <= hi:
+            if lo % 2 == 0:
+                res = max(res, T.M[lo])
+                lo += 1
+            if hi % 2 == 1:
+                res = max(res, T.M[hi])
+                hi -= 1
+            lo = (lo - 1) // 2
+            hi = (hi - 1) // 2
+        return res
+
+    # -- index operations --------------------------------------------------
+
+    @jit
+    def rank(T, t, i):
+        """Number of ``t`` bits in ``B[0..i]``: preorder rank for ``t = 1``."""
+        k = i // T.b
+        upper = min(min((k + 1) * T.b, T.size), i + 1)
+        r = 0
+        for j in range(k * T.b, upper):
+            r += T.B[j]
+        # opening parentheses before the block
+        r += T.r[T.n_internal + k]
+        if t:
+            return r
+        return (i - r) + 1
+
+    @jit
+    def select(T, t, k):
+        """Position of the ``k``-th ``t`` bit (``k`` from 1)."""
+        if t:
+            return T.k_index_1[k]
+        return T.k_index_0[k]
+
+    @jit
+    def excess(T, i):
+        """Opening minus closing parentheses in ``B[0..i]``."""
+        return T.e_index[i]
+
+    @jit
+    def scan_block_forward(T, i, k, d):
+        lower = max(max(k, 0) * T.b, i + 1)
+        upper = min((k + 1) * T.b, T.size)
+        for j in range(lower, upper):
+            if T.e_index[j] == d:
+                return j
+        return -1
+
+    @jit
+    def scan_block_backward(T, i, k, d):
+        lower = max(k, 0) * T.b - 1
+        if lower >= 0:
+            lower -= 1
+        upper = min((k + 1) * T.b, T.size) - 1
+        upper = min(i - 1, upper)
+        if upper <= 0:
+            return -1
+        for j in range(upper, lower, -1):
+            if T.e_index[j] == d:
+                return j
+        return -1
+
+    @jit
+    def fwdsearch(T, i, d):
+        """Position after ``i`` with excess ``excess(i) + d``, or -1."""
+        k = i // T.b
+        d += T.e_index[i]
+        node = T.n_internal + k
+        result = -1
+        if T.m[node] <= d <= T.M[node]:
+            result = scan_block_forward(T, i, k, d)
+        if result == -1:
+            while not bt_is_root(node):
+                if bt_is_left_child(node):
+                    node += 1
+                    if T.m[node] <= d <= T.M[node]:
+                        break
+                node = bt_parent(node)
+            if bt_is_root(node):
+                return -1
+            while not bt_is_leaf(node, T.n_internal):
+                node = 2 * node + 1
+                if not (T.m[node] <= d <= T.M[node]):
+                    node += 1
+            k = node - T.n_internal
+            result = scan_block_forward(T, i, k, d)
+        return result
+
+    @jit
+    def bwdsearch(T, i, d):
+        """Position before ``i`` with excess ``excess(i) + d``, or -1."""
+        k = i // T.b
+        d += T.e_index[i]
+        result = scan_block_backward(T, i, k, d)
+        node = T.n_internal + k
+        if result == -1 and bt_is_right_child(node):
+            node -= 1
+            k = node - T.n_internal
+            result = scan_block_backward(T, i, k, d)
+            k = i // T.b
+            node += 1
+        if result == -1:
+            while not bt_is_root(node):
+                if bt_is_right_child(node):
+                    node -= 1
+                    if T.m[node] <= d <= T.M[node]:
+                        break
+                node = bt_parent(node)
+            if bt_is_root(node):
+                return -1
+            while not bt_is_leaf(node, T.n_internal):
+                node = 2 * node + 2
+                if not (T.m[node] <= d <= T.M[node]):
+                    node -= 1
+            k = node - T.n_internal
+            result = scan_block_backward(T, i, k, d)
+        return result
+
+    @jit
+    def open(T, i):
+        if T.B[i] or i <= 0:
+            return i
+        return bwdsearch(T, i, 0) + 1
+
+    @jit
+    def close(T, i):
+        if not T.B[i]:
+            return i
+        return fwdsearch(T, i, -1)
+
+    @jit
+    def enclose(T, i):
+        if T.B[i]:
+            return bwdsearch(T, i, -2) + 1
+        return bwdsearch(T, i - 1, -2) + 1
+
+    @jit
+    def rmq(T, i, j):
         """Leftmost position of the minimum excess in ``[i, j]``."""
         if i >= j:
             return i
@@ -244,7 +385,7 @@ if NUMBA_AVAILABLE:
                 if T.e_index[p] < d_star:
                     d_star = T.e_index[p]
             if bi + 1 <= bj - 1:
-                tree_v = _tree_min(T, bi + 1, bj - 1)
+                tree_v = tree_min(T, bi + 1, bj - 1)
                 if tree_v < d_star:
                     d_star = tree_v
             for p in range(bj * b, j + 1):
@@ -252,23 +393,244 @@ if NUMBA_AVAILABLE:
                     d_star = T.e_index[p]
         if e_i == d_star:
             return i
-        return _fwdsearch(T, i, d_star - e_i)
+        return fwdsearch(T, i, d_star - e_i)
 
-    @njit
-    def _lca(T, i, j):
-        if _is_ancestor(T, i, j):
+    @jit
+    def rMq(T, i, j):
+        """Leftmost position of the maximum excess in ``[i, j]``."""
+        if i >= j:
             return i
-        elif _is_ancestor(T, j, i):
-            return j
-        return _parent(T, _rmq(T, i, j) + 1)
+        b = T.b
+        bi = i // b
+        bj = j // b
+        e_i = T.e_index[i]
+        m_star = e_i
+        if bi == bj:
+            for p in range(i + 1, j + 1):
+                if T.e_index[p] > m_star:
+                    m_star = T.e_index[p]
+        else:
+            for p in range(i + 1, min((bi + 1) * b, T.size)):
+                if T.e_index[p] > m_star:
+                    m_star = T.e_index[p]
+            if bi + 1 <= bj - 1:
+                tree_v = tree_max(T, bi + 1, bj - 1)
+                if tree_v > m_star:
+                    m_star = tree_v
+            for p in range(bj * b, j + 1):
+                if T.e_index[p] > m_star:
+                    m_star = T.e_index[p]
+        if e_i == m_star:
+            return i
+        return fwdsearch(T, i, m_star - e_i)
 
-    @njit
-    def _level_ancestor(T, i, d):
+    @jit
+    def mincount(T, i, j):
+        """Number of occurrences of the minimum excess in ``[i, j]``."""
+        lo = T.e_index[i]
+        c = 0
+        for p in range(i, j + 1):
+            e = T.e_index[p]
+            if e < lo:
+                lo = e
+                c = 1
+            elif e == lo:
+                c += 1
+        return c
+
+    @jit
+    def minselect(T, i, j, q):
+        """Position of the ``q``-th (from 1) minimum excess in ``[i, j]``, or -1."""
+        lo = T.e_index[i]
+        for p in range(i + 1, j + 1):
+            if T.e_index[p] < lo:
+                lo = T.e_index[p]
+        if q < 1:
+            return -1
+        for p in range(i, j + 1):
+            if T.e_index[p] == lo:
+                q -= 1
+                if q == 0:
+                    return p
+        return -1
+
+    # -- navigation ----------------------------------------------------------
+
+    @jit
+    def root(T):
+        return 0
+
+    @jit
+    def depth(T, i):
+        return T.e_index[i]
+
+    @jit
+    def parent(T, i):
+        """Parent of node ``i``, or -1 for the root."""
+        if i == 0 or i == T.size - 1:
+            return -1
+        return enclose(T, i)
+
+    @jit
+    def is_tip(T, i):
+        # a closing parenthesis short-circuits, so ``i + 1`` stays in range
+        return T.B[i] == 1 and T.B[i + 1] == 0
+
+    @jit
+    def first_child(T, i):
+        """First child of node ``i``, or 0 for a tip."""
+        if not T.B[i]:
+            i = open(T, i)
+        if is_tip(T, i):
+            return 0
+        return i + 1
+
+    @jit
+    def last_child(T, i):
+        """Last child of node ``i``, or 0 for a tip."""
+        if not T.B[i]:
+            i = open(T, i)
+        if is_tip(T, i):
+            return 0
+        return open(T, close(T, i) - 1)
+
+    @jit
+    def next_sibling(T, i):
+        """Next sibling of node ``i``, or 0 if none."""
+        if not T.B[i]:
+            i = open(T, i)
+        pos = close(T, i) + 1
+        if pos >= T.size or not T.B[pos]:
+            return 0
+        return pos
+
+    @jit
+    def previous_sibling(T, i):
+        """Previous sibling of node ``i``, or 0 if none."""
+        if not T.B[i]:
+            i = open(T, i)
+        if T.B[max(0, i - 1)]:
+            return 0
+        pos = open(T, i - 1)
+        if pos < 0 or not T.B[pos]:
+            return 0
+        return pos
+
+    @jit
+    def preorder_rank(T, i):
+        if not T.B[i]:
+            i = open(T, i)
+        return rank(T, 1, i)
+
+    @jit
+    def preorder_select(T, k):
+        return select(T, 1, k)
+
+    @jit
+    def postorder_rank(T, i):
+        if T.B[i]:
+            return rank(T, 0, close(T, i))
+        return rank(T, 0, i)
+
+    @jit
+    def postorder_select(T, k):
+        return open(T, select(T, 0, k))
+
+    @jit
+    def is_ancestor(T, i, j):
+        """Whether node ``i`` is an ancestor of node ``j``."""
+        if i == j:
+            return False
+        if not T.B[i]:
+            i = open(T, i)
+        return i <= j < close(T, i)
+
+    @jit
+    def count(T, i, tips):
+        """Number of nodes (or of tips) in the subtree of node ``i``."""
+        if not T.B[i]:
+            i = open(T, i)
+        last = close(T, i)
+        if not tips:
+            return (last - i + 1) // 2
+        c = 0
+        j = i
+        while j < last:
+            if T.B[j] and not T.B[j + 1]:
+                c += 1
+                j += 1
+            j += 1
+        return c
+
+    @jit
+    def level_ancestor(T, i, d):
+        """Ancestor ``d`` levels above node ``i``, or -1 for ``d <= 0``."""
         if d <= 0:
             return -1
         if not T.B[i]:
-            i = _open(T, i)
-        return _bwdsearch(T, i, -d - 1) + 1
+            i = open(T, i)
+        return bwdsearch(T, i, -d - 1) + 1
+
+    @jit
+    def level_next(T, i):
+        return fwdsearch(T, close(T, i), 1)
+
+    @jit
+    def lca(T, i, j):
+        """Lowest common ancestor of nodes ``i <= j``."""
+        if is_ancestor(T, i, j):
+            return i
+        elif is_ancestor(T, j, i):
+            return j
+        return parent(T, rmq(T, i, j) + 1)
+
+    @jit
+    def deepest_node(T, i):
+        return rMq(T, open(T, i), close(T, i))
+
+    @jit
+    def height(T, i):
+        """Height of node ``i``, in edges."""
+        return T.e_index[deepest_node(T, i)] - T.e_index[open(T, i)]
+
+    scope = locals()
+    return Primitives(*(scope[name] for name in Primitives._fields))
+
+
+# Device-function primitives, by Numba GPU module (built on first use).
+_gpu_primitives = {}
+
+
+def gpu_primitives(gpu):
+    """The primitives compiled as device functions of a Numba GPU module.
+
+    Parameters
+    ----------
+    gpu : module
+        ``numba.cuda`` or ``numba.hip`` (e.g. from
+        ``skbio.stats.distance._gpu._numba_gpu_module_for``).
+
+    Returns
+    -------
+    Primitives
+        Device functions, callable from the ``gpu.jit`` kernels of that module.
+        Each is compiled when a kernel calling it is.
+    """
+    name = gpu.__name__
+    if name not in _gpu_primitives:
+        _gpu_primitives[name] = define_primitives(gpu.jit(device=True))
+    return _gpu_primitives[name]
+
+
+if NUMBA_AVAILABLE:
+    #: The primitives compiled for the CPU.
+    CPU = define_primitives(njit, njit(inline="always"))
+
+    # used by the batch kernels below
+    _close = CPU.close
+    _parent = CPU.parent
+    _lca = CPU.lca
+    _level_ancestor = CPU.level_ancestor
 
     # -- batch kernels (engine="numba") ---------------------------------------
 
