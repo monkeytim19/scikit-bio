@@ -168,8 +168,18 @@ def define_primitives(jit, jit_inline=None):
         The decorator compiling each primitive: ``numba.njit`` for the CPU, or
         ``gpu.jit(device=True)`` for device functions of a Numba GPU module.
     jit_inline : callable, optional
-        The decorator for the one-line helpers on the rmM tree's node indices,
-        e.g. ``numba.njit(inline="always")``. Defaults to ``jit``.
+        The decorator for the small leaf primitives that the others call on
+        every step (``rank``, ``select``, ``excess``, ``open``, ``close``,
+        ``enclose``, ``depth``, ``parent``, ``is_tip``, ``is_ancestor``) and for
+        the helpers on the rmM tree's node indices, e.g.
+        ``numba.njit(inline="always")``. Defaults to ``jit``.
+
+    Notes
+    -----
+    Inlining the leaf primitives removes a function call per step from the
+    operations built on them. The searches (``fwdsearch``, ``bwdsearch``) and
+    the range queries stay out of line: inlining them too copies them into
+    every caller, which multiplies compile time (several-fold for ``lca``).
 
     Returns
     -------
@@ -243,7 +253,7 @@ def define_primitives(jit, jit_inline=None):
 
     # -- index operations --------------------------------------------------
 
-    @jit
+    @jit_inline
     def rank(T, t, i):
         """Number of ``t`` bits in ``B[0..i]``: preorder rank for ``t = 1``."""
         k = i // T.b
@@ -257,14 +267,14 @@ def define_primitives(jit, jit_inline=None):
             return r
         return (i - r) + 1
 
-    @jit
+    @jit_inline
     def select(T, t, k):
         """Position of the ``k``-th ``t`` bit (``k`` from 1)."""
         if t:
             return T.k_index_1[k]
         return T.k_index_0[k]
 
-    @jit
+    @jit_inline
     def excess(T, i):
         """Opening minus closing parentheses in ``B[0..i]``."""
         return T.e_index[i]
@@ -348,19 +358,19 @@ def define_primitives(jit, jit_inline=None):
             result = scan_block_backward(T, i, k, d)
         return result
 
-    @jit
+    @jit_inline
     def open(T, i):
         if T.B[i] or i <= 0:
             return i
         return bwdsearch(T, i, 0) + 1
 
-    @jit
+    @jit_inline
     def close(T, i):
         if not T.B[i]:
             return i
         return fwdsearch(T, i, -1)
 
-    @jit
+    @jit_inline
     def enclose(T, i):
         if T.B[i]:
             return bwdsearch(T, i, -2) + 1
@@ -460,18 +470,18 @@ def define_primitives(jit, jit_inline=None):
     def root(T):
         return 0
 
-    @jit
+    @jit_inline
     def depth(T, i):
         return T.e_index[i]
 
-    @jit
+    @jit_inline
     def parent(T, i):
         """Parent of node ``i``, or -1 for the root."""
         if i == 0 or i == T.size - 1:
             return -1
         return enclose(T, i)
 
-    @jit
+    @jit_inline
     def is_tip(T, i):
         # a closing parenthesis short-circuits, so ``i + 1`` stays in range
         return T.B[i] == 1 and T.B[i + 1] == 0
@@ -536,7 +546,7 @@ def define_primitives(jit, jit_inline=None):
     def postorder_select(T, k):
         return open(T, select(T, 0, k))
 
-    @jit
+    @jit_inline
     def is_ancestor(T, i, j):
         """Whether node ``i`` is an ancestor of node ``j``."""
         if i == j:
